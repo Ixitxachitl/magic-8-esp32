@@ -40,6 +40,25 @@ static const int ico_edge[ICO_EDGES][2] = {
     {10,11}
 };
 
+/* 20 triangular faces of the icosahedron (vertex triples) */
+#define ICO_FACES 20
+static const int ico_face[ICO_FACES][3] = {
+    {0,2,8},  {0,2,10}, {0,4,5},  {0,4,8},  {0,5,10},
+    {1,3,9},  {1,3,11}, {1,4,5},  {1,4,9},  {1,5,11},
+    {2,6,7},  {2,6,8},  {2,7,10}, {3,6,7},  {3,6,9},
+    {3,7,11}, {4,8,9},  {5,10,11},{6,8,9},  {7,10,11}
+};
+
+/* For each edge, which 2 faces share it (indices into ico_face[]) */
+static const int edge_faces[ICO_EDGES][2] = {
+    { 0, 1}, { 2, 3}, { 2, 4}, { 0, 3}, { 1, 4},   /* edges 0-4  */
+    { 5, 6}, { 7, 8}, { 7, 9}, { 5, 8}, { 6, 9},   /* edges 5-9  */
+    {10,11}, {10,12}, { 0,11}, { 1,12}, {13,14},     /* edges 10-14*/
+    {13,15}, { 5,14}, { 6,15}, { 2, 7}, { 3,16},     /* edges 15-19*/
+    { 8,16}, { 4,17}, { 9,17}, {10,13}, {11,18},     /* edges 20-24*/
+    {14,18}, {12,19}, {15,19}, {16,18}, {17,19}      /* edges 25-29*/
+};
+
 /* ── LVGL objects ──────────────────────────────────────────────── */
 static lv_obj_t  *bg_circle;
 static lv_obj_t  *ico_line[ICO_EDGES];    /* 30 wireframe edge segments  */
@@ -110,9 +129,9 @@ static void update_icosahedron_ex(float ry, float rx, float scl)
     float cy_r = cosf(ry), sy_r = sinf(ry);
     float cx_r = cosf(rx), sx_r = sinf(rx);
 
-    /* Project all 12 vertices */
-    float pv[ICO_VERTS][2];
-    float pz[ICO_VERTS];
+    /* Rotate all 12 vertices (store full 3D + projected 2D) */
+    float rv[ICO_VERTS][3];   /* rotated 3D coords */
+    float pv[ICO_VERTS][2];   /* projected 2D       */
 
     for (int i = 0; i < ICO_VERTS; i++) {
         float x = ico_v[i][0] * scl, y = ico_v[i][1] * scl, z = ico_v[i][2] * scl;
@@ -127,11 +146,42 @@ static void update_icosahedron_ex(float ry, float rx, float scl)
         float y2 = y1 * cx_r - z1 * sx_r;
         float z2 = y1 * sx_r + z1 * cx_r;
 
+        rv[i][0] = x2; rv[i][1] = y2; rv[i][2] = z2;
+
         /* Perspective projection */
         float s = PERSP_D / (PERSP_D + z2);
         pv[i][0] = x2 * s;
         pv[i][1] = y2 * s;
-        pz[i] = z2;
+    }
+
+    /* ── Face-normal back-face culling ────────────────────────── */
+    /* A face is front-facing if its outward normal points toward
+       the camera (z < 0 in our coord system).                     */
+    bool face_vis[ICO_FACES];
+    for (int f = 0; f < ICO_FACES; f++) {
+        int a = ico_face[f][0], b = ico_face[f][1], c = ico_face[f][2];
+        /* edge vectors in rotated 3D space */
+        float e1x = rv[b][0] - rv[a][0];
+        float e1y = rv[b][1] - rv[a][1];
+        float e1z = rv[b][2] - rv[a][2];
+        float e2x = rv[c][0] - rv[a][0];
+        float e2y = rv[c][1] - rv[a][1];
+        float e2z = rv[c][2] - rv[a][2];
+        /* cross product  n = e1 × e2 */
+        float nx = e1y * e2z - e1z * e2y;
+        float ny = e1z * e2x - e1x * e2z;
+        float nz = e1x * e2y - e1y * e2x;
+        /* centroid (direction of outward normal for convex shape at origin) */
+        float mx = rv[a][0] + rv[b][0] + rv[c][0];
+        float my = rv[a][1] + rv[b][1] + rv[c][1];
+        float mz = rv[a][2] + rv[b][2] + rv[c][2];
+        /* ensure normal points outward (same hemisphere as centroid) */
+        float dot = nx * mx + ny * my + nz * mz;
+        float outward_nz = (dot > 0) ? nz : -nz;
+        /* front-facing if outward normal points toward camera (z < 0)
+           Use a small positive threshold so silhouette (edge-on) faces
+           are included – prevents flickering edges at the equator.     */
+        face_vis[f] = (outward_nz < 0.15f);
     }
 
     /* Blend factor: 0 = normal wireframe, 1 = settled triangle only */
@@ -152,12 +202,11 @@ static void update_icosahedron_ex(float ry, float rx, float scl)
         /* Is this one of the 3 front-face triangle edges? */
         bool is_front_face = (e == front_edge[0] || e == front_edge[1] || e == front_edge[2]);
 
-        /* Back-face cull: hide edges whose midpoint is behind centre */
-        float avg_z = (pz[a] + pz[b]) * 0.5f;
-        bool behind = (avg_z > ico_radius * scl * 0.15f);
+        /* Edge is visible if at least one adjacent face is front-facing */
+        bool visible = face_vis[edge_faces[e][0]] || face_vis[edge_faces[e][1]];
 
         lv_opa_t opa;
-        if (behind) {
+        if (!visible) {
             opa = LV_OPA_TRANSP;
         } else if (is_front_face) {
             opa = LV_OPA_COVER;
@@ -226,6 +275,11 @@ static void anim_tick(lv_timer_t *t)
             target_scale = SETTLED_SCALE;
             scale_animating = true;
             animating = false;
+            /* hide all bubbles now that spin is done */
+            for (int i = 0; i < NUM_BUBBLES; i++) {
+                lv_obj_add_flag(bubbles[i].obj, LV_OBJ_FLAG_HIDDEN);
+                bubbles[i].active = false;
+            }
             void (*cb)(void) = settle_cb;
             settle_cb = NULL;
             show_settled_pose(visual_scale);
@@ -348,7 +402,6 @@ void magic8ball_ui_init(lv_obj_t *parent, int screen_size)
     lv_obj_add_flag(bg_circle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_clip_corner(bg_circle, true, 0);
     lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     /* -- create bubble objects (behind icosahedron) -- */
     for (int i = 0; i < NUM_BUBBLES; i++) {
@@ -538,7 +591,7 @@ void magic8ball_ui_start_anim(void)
     if (anim_timer)
         lv_timer_resume(anim_timer);
     else
-        anim_timer = lv_timer_create(anim_tick, 33, NULL);
+        anim_timer = lv_timer_create(anim_tick, 16, NULL);
 }
 
 /* ── stop animation, reset to default pose ─────────────────────── */

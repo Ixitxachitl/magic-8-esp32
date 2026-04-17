@@ -27,6 +27,7 @@
 #include "tone_player.h"
 #include "tts_sam.h"
 #include "tts_groq.h"
+#include <esp_task_wdt.h>
 
 /* ── Classic Magic 8 Ball fallback answers (no-WiFi mode) ──────── */
 static const char *CLASSIC[] = {
@@ -102,10 +103,20 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area,
 TouchDrvCST92xx touch;
 static bool touch_ok = false;
 
+/* I2C bus mutex – protects Wire access across cores */
+static SemaphoreHandle_t i2c_mux = NULL;
+
 static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     int16_t x[1], y[1];
-    if (touch_ok && touch.getPoint(x, y, 1)) {
+    bool pressed = false;
+    if (touch_ok && i2c_mux) {
+        if (xSemaphoreTake(i2c_mux, pdMS_TO_TICKS(5))) {
+            pressed = touch.getPoint(x, y, 1);
+            xSemaphoreGive(i2c_mux);
+        }
+    }
+    if (pressed) {
         data->point.x = (LCD_WIDTH  - 1) - x[0];
         data->point.y = (LCD_HEIGHT - 1) - y[0];
         data->state   = LV_INDEV_STATE_PR;
@@ -118,13 +129,36 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 SensorQMI8658 imu;
 static bool imu_ok = false;
 #define SHAKE_COOLDOWN_MS 2000
-#define SHAKE_JOLT_THRESH 0.15f   /* 0.15 g above baseline */
+#define SHAKE_JOLT_THRESH 0.5f    /* 0.5 g above baseline */
 static unsigned long last_shake_ms  = 0;
 static float         acc_baseline   = 0;
+
+/* ── Power button double-press detection ───────────────────────── */
+#define DOUBLE_PRESS_WINDOW_MS 600
+static unsigned long last_pkey_ms     = 0;
+static int           pkey_press_count = 0;
 
 /* ── PMIC ──────────────────────────────────────────────────────── */
 XPowersAXP2101 pmic;
 static bool pmic_ok = false;
+
+/* ── LVGL rendering task (runs on core 0 for smooth animation) ── */
+static SemaphoreHandle_t lvgl_mux = NULL;
+
+static void lvgl_task(void *param)
+{
+    (void)param;
+    for (;;) {
+        if (xSemaphoreTakeRecursive(lvgl_mux, portMAX_DELAY)) {
+            lv_timer_handler();
+            xSemaphoreGiveRecursive(lvgl_mux);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static inline void lvgl_lock(void)   { xSemaphoreTakeRecursive(lvgl_mux, portMAX_DELAY); }
+static inline void lvgl_unlock(void) { xSemaphoreGiveRecursive(lvgl_mux); }
 
 /* ── Ask the 8 Ball ────────────────────────────────────────────── */
 static bool use_llm = false;
@@ -172,28 +206,36 @@ static void on_settle_done(void) { settle_complete = true; }
 
 static void on_ask(void)
 {
-    if (app_state != STATE_IDLE) {
-        Serial.println("[MAIN] on_ask: not idle, ignoring");
+    if (app_state != STATE_IDLE || tts_playing) {
+        Serial.println("[MAIN] on_ask: busy, ignoring");
         return;
     }
 
     Serial.println("[MAIN] on_ask: Asking the 8 Ball...");
+    lvgl_lock();
     magic8ball_ui_start_anim();
+
+    lvgl_unlock();
 
     /* If mic + LLM available → voice flow */
     if (use_llm && mic_ok) {
         tone_player_beep_listen();
         mic_recorder_start();
+        lvgl_lock();
         magic8ball_ui_set_listening(true);
-        app_state      = STATE_LISTENING;
-        last_partial_ms = millis();
+        lvgl_unlock();
+        app_state        = STATE_LISTENING;
+        last_partial_ms  = millis();
+        final_transcript = "";   /* clear for fresh capture */
         Serial.println("[MAIN] Entered LISTENING state (voice)");
         return;
     }
 
     /* LLM without mic → direct request */
     if (use_llm) {
+        lvgl_lock();
         magic8ball_ui_set_thinking(true);
+        lvgl_unlock();
         llm_start_request();
         app_state = STATE_ASKING_LLM;
         Serial.println("[MAIN] Entered ASKING_LLM state (no mic)");
@@ -201,27 +243,36 @@ static void on_ask(void)
     }
 
     /* Offline → classic answer */
+    lvgl_lock();
     magic8ball_ui_set_thinking(true);
+    lvgl_unlock();
     int idx = random(0, NUM_CLASSIC);
     Serial.printf("[MAIN] Offline, classic answer #%d\n", idx);
     static int chosen;
     chosen = idx;
+    lvgl_lock();
     lv_timer_create([](lv_timer_t *t) {
         magic8ball_ui_stop_anim();
         magic8ball_ui_set_answer(CLASSIC[*((int *)t->user_data)]);
         lv_timer_del(t);
     }, 1200, &chosen);
+    lvgl_unlock();
     /* stay IDLE – timer callback shows answer */
 }
 
 static void on_longpress(void)
 {
-    Serial.println("[MAIN] Long-press detected – entering AP setup");
+    if (tts_playing || app_state != STATE_IDLE) return;
+
+    Serial.println("[MAIN] Double-press detected \u2013 entering AP setup");
+    lvgl_lock();
     magic8ball_ui_set_answer("Entering\nsetup...");
-    lv_timer_handler();
+    lvgl_unlock();
     delay(800);
     config_portal_start_ap();
+    lvgl_lock();
     magic8ball_ui_set_answer("Connect WiFi:\nMagic8Ball\n-Setup\n192.168.4.1");
+    lvgl_unlock();
 }
 
 /* ── Arduino setup ─────────────────────────────────────────────── */
@@ -236,6 +287,9 @@ void setup()
     Wire.begin(IIC_SDA, IIC_SCL);
     delay(50);
     Serial.printf("[INIT] I2C started (SDA=%d SCL=%d)\n", IIC_SDA, IIC_SCL);
+
+    /* I2C bus mutex – must be created before any I2C peripheral init */
+    i2c_mux = xSemaphoreCreateMutex();
 
     /* ── PMIC (powers other I2C devices) ─────────────────────── */
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -340,11 +394,26 @@ void setup()
     Serial.println("[INIT] Creating Magic 8 Ball UI...");
     magic8ball_ui_init(lv_scr_act(), LCD_WIDTH);
     magic8ball_ui_set_tap_cb(on_ask);
-    magic8ball_ui_set_longpress_cb(on_longpress);
+    /* AP mode is triggered by double-pressing the power button, not touch */
 
     /* first render so the user sees something during WiFi connect */
     magic8ball_ui_set_answer("Connecting\nto WiFi...");
     lv_timer_handler();
+
+    /* ── Start LVGL rendering task on core 0 ──────────────────── */
+    lvgl_mux = xSemaphoreCreateRecursiveMutex();
+    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 3, NULL, 0);
+    /* LVGL task owns core 0 and starves IDLE0 during QSPI flush.
+       Deinit the task WDT and reinit without idle-task monitoring
+       so IDLE0 starvation doesn't trigger a panic. */
+    esp_task_wdt_deinit();
+    const esp_task_wdt_config_t twdt_cfg = {
+        .timeout_ms    = 5000,
+        .idle_core_mask = 0,       /* don't subscribe any idle tasks */
+        .trigger_panic  = true,
+    };
+    esp_task_wdt_init(&twdt_cfg);
+    Serial.println("[INIT] LVGL rendering task started on core 0");
 
     /* ── WiFi + config portal ────────────────────────────────── */    Serial.println("[INIT] Starting WiFi / config portal...");    config_portal_begin();
 
@@ -403,21 +472,25 @@ void setup()
 /* ── Arduino loop ──────────────────────────────────────────────── */
 void loop()
 {
-    /* service LVGL */
-    lv_timer_handler();
+    /* LVGL is serviced by the dedicated lvgl_task on core 0 */
 
     /* ── state machine ─────────────────────────────────────────── */
     switch (app_state) {
 
     case STATE_LISTENING: {
         /* audio-level → triangle glow */
+        lvgl_lock();
         magic8ball_ui_set_audio_level(mic_recorder_get_audio_level());
+        lvgl_unlock();
 
         /* pick up any partial STT result */
         String partial;
         if (stt_check_result(partial) && partial.length() > 0) {
             Serial.printf("[LOOP] Partial transcript: \"%s\"\n", partial.c_str());
+            final_transcript = partial;   /* keep latest for fast path */
+            lvgl_lock();
             magic8ball_ui_set_transcript(partial.c_str());
+            lvgl_unlock();
         }
 
         /* fire partial STT every 3 s while enough audio exists */
@@ -434,9 +507,27 @@ void loop()
         if (mic_recorder_speech_ended()) {
             Serial.println("[LOOP] Speech ended → TRANSCRIBING");
             tone_player_beep_done();
-            app_state       = STATE_TRANSCRIBING;
-            final_stt_sent  = false;
-            transcript_shown_ms = 0;
+
+            /* If we already have a partial transcript, skip the final
+               STT round-trip and use it immediately – saves 2-4 seconds */
+            String last_partial;
+            stt_check_result(last_partial);   /* drain any pending result */
+            if (final_transcript.length() > 0 || last_partial.length() > 0) {
+                if (last_partial.length() > 0)
+                    final_transcript = last_partial;
+                Serial.printf("[LOOP] Using partial transcript: \"%s\"\n",
+                              final_transcript.c_str());
+                settle_complete = false;
+                lvgl_lock();
+                magic8ball_ui_settle_then(on_settle_done);
+                lvgl_unlock();
+                app_state = STATE_SETTLING_TRANSCRIPT;
+                Serial.println("[LOOP] → SETTLING_TRANSCRIPT (fast path)");
+            } else {
+                app_state       = STATE_TRANSCRIBING;
+                final_stt_sent  = false;
+                transcript_shown_ms = 0;
+            }
         }
 
         /* timeout: back out if no speech for 8 seconds */
@@ -444,8 +535,10 @@ void loop()
             mic_recorder_get_sample_count() < 16000) {
             Serial.println("[LOOP] Listening timeout – no speech detected");
             mic_recorder_stop();
+            lvgl_lock();
             magic8ball_ui_stop_anim();
             magic8ball_ui_set_answer("SHAKE\nOR TAP");
+            lvgl_unlock();
             app_state = STATE_IDLE;
         }
         break;
@@ -470,13 +563,17 @@ void loop()
                     final_transcript = text;
                     /* settle spin before showing transcript */
                     settle_complete = false;
+                    lvgl_lock();
                     magic8ball_ui_settle_then(on_settle_done);
+                    lvgl_unlock();
                     app_state = STATE_SETTLING_TRANSCRIPT;
                     Serial.println("[LOOP] → SETTLING_TRANSCRIPT");
                 } else {
                     Serial.println("[LOOP] Empty transcript – back to idle");
+                    lvgl_lock();
                     magic8ball_ui_stop_anim();
                     magic8ball_ui_set_answer("I didn't\nhear anything");
+                    lvgl_unlock();
                     app_state = STATE_IDLE;
                 }
             }
@@ -486,7 +583,9 @@ void loop()
 
     case STATE_SETTLING_TRANSCRIPT: {
         if (settle_complete) {
+            lvgl_lock();
             magic8ball_ui_set_transcript(final_transcript.c_str());
+            lvgl_unlock();
             transcript_shown_ms = millis();
             app_state = STATE_SHOWING_TRANSCRIPT;
             Serial.println("[LOOP] → SHOWING_TRANSCRIPT");
@@ -497,9 +596,11 @@ void loop()
     case STATE_SHOWING_TRANSCRIPT: {
         /* show transcript for 1.5 s, then resume spin and ask LLM */
         if (millis() - transcript_shown_ms > 1500) {
+            lvgl_lock();
             magic8ball_ui_start_anim();
-            llm_start_request_with_question(final_transcript);
             magic8ball_ui_set_thinking(true);
+            lvgl_unlock();
+            llm_start_request_with_question(final_transcript);
             app_state = STATE_ASKING_LLM;
             Serial.println("[LOOP] → ASKING_LLM");
         }
@@ -512,7 +613,9 @@ void loop()
             Serial.printf("[LOOP] LLM answer: \"%s\"\n", answer.c_str());
             pending_answer = answer;
             settle_complete = false;
+            lvgl_lock();
             magic8ball_ui_settle_then(on_settle_done);
+            lvgl_unlock();
             app_state = STATE_SETTLING_ANSWER;
             Serial.println("[LOOP] → SETTLING_ANSWER");
         }
@@ -522,9 +625,9 @@ void loop()
     case STATE_SETTLING_ANSWER: {
         if (settle_complete) {
             tone_player_chime();
+            lvgl_lock();
             magic8ball_ui_set_answer(pending_answer.c_str());
-            /* Flush LVGL so the answer text is visible */
-            lv_timer_handler();
+            lvgl_unlock();
             /* Play TTS on background task so main loop never blocks */
             if (tts_mode_str != "off" && pending_answer.length() > 0) {
                 tts_task_buf = strdup(pending_answer.c_str());
@@ -547,9 +650,11 @@ void loop()
         String answer;
         if (llm_check_result(answer)) {
             Serial.printf("[LOOP] LLM answer: \"%s\"\n", answer.c_str());
+            lvgl_lock();
             magic8ball_ui_stop_anim();
-            tone_player_chime();
             magic8ball_ui_set_answer(answer.c_str());
+            lvgl_unlock();
+            tone_player_chime();
         }
         break;
     }
@@ -559,7 +664,10 @@ void loop()
     /* ── shake detection (any state == IDLE) ────────────────────── */
     if (imu_ok) {
         float ax, ay, az;
-        if (imu.getAccelerometer(ax, ay, az)) {
+        xSemaphoreTake(i2c_mux, portMAX_DELAY);
+        bool got = imu.getAccelerometer(ax, ay, az);
+        xSemaphoreGive(i2c_mux);
+        if (got) {
             float mag = sqrtf(ax * ax + ay * ay + az * az);
 
             /* Adaptive baseline: faster EMA so it settles quickly */
@@ -581,14 +689,28 @@ void loop()
         }
     }
 
-    /* PMIC button: short press wakes screen */
+    /* PMIC button: single press = wake screen, double press = AP setup */
     if (pmic_ok) {
+        xSemaphoreTake(i2c_mux, portMAX_DELAY);
         pmic.getIrqStatus();
-        if (pmic.isPekeyShortPressIrq()) {
-            Serial.println("[LOOP] Power button pressed – screen ON");
-            gfx->setBrightness(200);
-        }
+        bool short_press = pmic.isPekeyShortPressIrq();
         pmic.clearIrqStatus();
+        xSemaphoreGive(i2c_mux);
+        if (short_press) {
+            unsigned long now = millis();
+            gfx->setBrightness(200);
+            if (now - last_pkey_ms < DOUBLE_PRESS_WINDOW_MS) {
+                pkey_press_count++;
+            } else {
+                pkey_press_count = 1;
+            }
+            last_pkey_ms = now;
+            if (pkey_press_count >= 2) {
+                Serial.println("[LOOP] Power button double-press!");
+                pkey_press_count = 0;
+                on_longpress();
+            }
+        }
     }
 
     /* config portal */
