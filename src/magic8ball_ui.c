@@ -66,6 +66,11 @@ static lv_point_t ico_pts[ICO_EDGES][2];  /* projected 2D endpoints      */
 static lv_obj_t  *answer_lbl;
 static lv_obj_t  *thinking_lbl;
 
+/* ── Filled-face state (updated each frame, drawn via event) ───── */
+static lv_point_t face_2d[ICO_FACES][3];  /* projected triangle verts    */
+static bool       face_front[ICO_FACES];  /* front-facing this frame?    */
+static float      face_avg_z[ICO_FACES];  /* avg Z depth for shading     */
+
 static float center_x, center_y;   /* icosahedron centre in bg_circle */
 
 #define PERSP_D  500.0f
@@ -88,6 +93,8 @@ static int         spin_rate    = 50;      /* 0.1 deg per tick           */
 /* ── settle (deceleration) state ───────────────────────────────── */
 static bool        settling     = false;
 static void      (*settle_cb)(void) = NULL;
+static bool        settling_blend = false;   /* phase 2: rotating to settled */
+static float       blend_angle    = 0.0f;    /* tenth-degrees, easing to 0   */
 
 /* ── bubble particles ──────────────────────────────────────────── */
 #define NUM_BUBBLES 14
@@ -177,11 +184,27 @@ static void update_icosahedron_ex(float ry, float rx, float scl)
         float mz = rv[a][2] + rv[b][2] + rv[c][2];
         /* ensure normal points outward (same hemisphere as centroid) */
         float dot = nx * mx + ny * my + nz * mz;
-        float outward_nz = (dot > 0) ? nz : -nz;
-        /* front-facing if outward normal points toward camera (z < 0)
-           Use a small positive threshold so silhouette (edge-on) faces
-           are included – prevents flickering edges at the equator.     */
-        face_vis[f] = (outward_nz < 0.15f);
+        if (dot < 0) { nx = -nx; ny = -ny; nz = -nz; }
+        /* Perspective-correct back-face culling:
+           view direction from face centroid to camera at (0, 0, -PERSP_D) */
+        float cx3 = mx / 3.0f, cy3 = my / 3.0f, cz3 = mz / 3.0f;
+        float vis_dot = nx * (-cx3) + ny * (-cy3) + nz * (-PERSP_D - cz3);
+        face_vis[f] = (vis_dot > 0.0f);
+
+        /* Store projected 2D verts + depth for the draw event */
+        face_front[f] = face_vis[f];
+        if (face_vis[f]) {
+            float s_a = PERSP_D / (PERSP_D + rv[a][2]);
+            float s_b = PERSP_D / (PERSP_D + rv[b][2]);
+            float s_c = PERSP_D / (PERSP_D + rv[c][2]);
+            face_2d[f][0].x = (lv_coord_t)(center_x + rv[a][0] * s_a);
+            face_2d[f][0].y = (lv_coord_t)(center_y + rv[a][1] * s_a);
+            face_2d[f][1].x = (lv_coord_t)(center_x + rv[b][0] * s_b);
+            face_2d[f][1].y = (lv_coord_t)(center_y + rv[b][1] * s_b);
+            face_2d[f][2].x = (lv_coord_t)(center_x + rv[c][0] * s_c);
+            face_2d[f][2].y = (lv_coord_t)(center_y + rv[c][1] * s_c);
+            face_avg_z[f] = (rv[a][2] + rv[b][2] + rv[c][2]) / 3.0f;
+        }
     }
 
     /* Blend factor: 0 = normal wireframe, 1 = settled triangle only */
@@ -211,18 +234,12 @@ static void update_icosahedron_ex(float ry, float rx, float scl)
         } else if (is_front_face) {
             opa = LV_OPA_COVER;
         } else {
-            /* Non-front-face visible edges fade out as we zoom in */
-            opa = (lv_opa_t)(LV_OPA_COVER * (1.0f - t));
+            /* Non-front-face visible edges: dim when settled, full when spinning */
+            float dim = 1.0f - t * 0.65f;   /* 100% → 35% opacity */
+            opa = (lv_opa_t)(LV_OPA_COVER * dim);
         }
         lv_obj_set_style_line_opa(ico_line[e], opa, 0);
     }
-}
-
-static void update_icosahedron(int angle_tenth)
-{
-    float ry = (float)angle_tenth * M_PI / 1800.0f;
-    float rx = ry * 0.37f;
-    update_icosahedron_ex(ry, rx, visual_scale);
 }
 
 /* ── Settled pose: face (2,6,7) facing camera, vertex 2 at top ─── */
@@ -230,6 +247,14 @@ static void update_icosahedron(int angle_tenth)
     with v2=(0,-1,φ) at the top (upward-pointing triangle).        */
 #define SETTLE_RY  0.0f
 #define SETTLE_RX  1.931f
+
+static void update_icosahedron(int angle_tenth)
+{
+    /* Offset so spin_angle=0 matches the settled pose exactly */
+    float ry = SETTLE_RY + (float)angle_tenth * M_PI / 1800.0f;
+    float rx = SETTLE_RX + (float)angle_tenth * M_PI / 1800.0f * 0.37f;
+    update_icosahedron_ex(ry, rx, visual_scale);
+}
 
 static void show_settled_pose(float scl)
 {
@@ -243,49 +268,94 @@ static void anim_tick(lv_timer_t *t)
 
     /* --- scale animation (zoom in/out) runs before everything else --- */
     if (scale_animating) {
-        float diff = target_scale - visual_scale;
-        if (fabsf(diff) < 0.02f) {
-            visual_scale = target_scale;
+        /* If settle was requested during zoom-out, skip to spinning */
+        if (settling && pending_spin) {
+            visual_scale    = target_scale;
             scale_animating = false;
-            if (pending_spin) {
-                /* zoom-out complete → start actual spinning */
-                pending_spin = false;
-                animating = true;
-            } else if (!animating) {
-                /* zoom-in complete, idle → pause timer */
-                lv_timer_pause(anim_timer);
-            }
+            pending_spin    = false;
+            animating       = true;
+            /* fall through to settling code below */
         } else {
-            visual_scale += diff * 0.12f;
+            float diff = target_scale - visual_scale;
+            if (fabsf(diff) < 0.02f) {
+                visual_scale = target_scale;
+                scale_animating = false;
+                if (pending_spin) {
+                    pending_spin = false;
+                    animating = true;
+                } else if (!animating) {
+                    lv_timer_pause(anim_timer);
+                }
+            } else {
+                visual_scale += diff * 0.18f;
+            }
+            show_settled_pose(visual_scale);
+            return;
         }
-        show_settled_pose(visual_scale);
-        return;
     }
 
     if (!animating) return;
 
-    /* --- handle settling (deceleration) --- */
-    if (settling && spin_rate > 0) {
-        spin_rate -= 3;
+    /* --- handle settling (unified: decel → blend+zoom) --- */
+    if (settling) {
+        /* Decelerate spin quickly */
+        if (spin_rate > 0) {
+            spin_rate -= 6;
+            if (spin_rate < 0) spin_rate = 0;
+            /* Still spinning – fall through to normal spin/bubble code */
+        }
+
         if (spin_rate <= 0) {
-            spin_rate = 0;
-            settling  = false;
-            /* snap to settled pose + begin enlarge */
-            visual_scale = 1.0f;
-            target_scale = SETTLED_SCALE;
-            scale_animating = true;
-            animating = false;
-            /* hide all bubbles now that spin is done */
-            for (int i = 0; i < NUM_BUBBLES; i++) {
-                lv_obj_add_flag(bubbles[i].obj, LV_OBJ_FLAG_HIDDEN);
-                bubbles[i].active = false;
+            /* Spin stopped – enter or continue blend phase */
+            if (!settling_blend) {
+                settling_blend = true;
+                blend_angle = (float)spin_angle;
+                if (blend_angle > 1800.0f) blend_angle -= 3600.0f;
+                /* hide bubbles, restore default edge colour */
+                for (int i = 0; i < NUM_BUBBLES; i++) {
+                    lv_obj_add_flag(bubbles[i].obj, LV_OBJ_FLAG_HIDDEN);
+                    bubbles[i].active = false;
+                }
+                for (int e = 0; e < ICO_EDGES; e++)
+                    lv_obj_set_style_line_color(ico_line[e], lv_color_hex(0x1a4a80), 0);
             }
-            void (*cb)(void) = settle_cb;
-            settle_cb = NULL;
-            show_settled_pose(visual_scale);
-            if (cb) cb();
+
+            /* Ease blend_angle toward 0 */
+            float step = blend_angle * 0.25f;
+            float max_step = 80.0f;
+            if (step >  max_step) step =  max_step;
+            if (step < -max_step) step = -max_step;
+            blend_angle -= step;
+
+            /* Simultaneously ease scale toward SETTLED_SCALE */
+            float sdiff = SETTLED_SCALE - visual_scale;
+            visual_scale += sdiff * 0.18f;
+
+            /* Check if both rotation and scale are done */
+            bool angle_done = fabsf(blend_angle) < 2.0f;
+            bool scale_done = fabsf(visual_scale - SETTLED_SCALE) < 0.02f;
+
+            if (angle_done && scale_done) {
+                blend_angle    = 0.0f;
+                visual_scale   = SETTLED_SCALE;
+                settling_blend = false;
+                settling       = false;
+                animating      = false;
+                void (*cb)(void) = settle_cb;
+                settle_cb = NULL;
+                show_settled_pose(SETTLED_SCALE);
+                if (anim_timer) lv_timer_pause(anim_timer);
+                if (cb) cb();
+            } else {
+                float a = angle_done ? 0.0f : blend_angle;
+                update_icosahedron_ex(
+                    SETTLE_RY + a * (float)M_PI / 1800.0f,
+                    SETTLE_RX + a * (float)M_PI / 1800.0f * 0.37f,
+                    visual_scale);
+            }
             return;
         }
+        /* spin_rate > 0: fall through to normal spin/bubble code */
     }
 
     /* --- spin icosahedron --- */
@@ -363,6 +433,52 @@ static void anim_tick(lv_timer_t *t)
     }
 }
 
+/* ── draw event: filled dark-blue triangles for front-facing faces ─ */
+static void ico_face_draw_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
+
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+
+    lv_area_t coords;
+    lv_obj_get_coords(obj, &coords);
+
+    /* find Z range of visible faces for depth-based shading */
+    float z_min = 1e9f, z_max = -1e9f;
+    for (int f = 0; f < ICO_FACES; f++) {
+        if (!face_front[f]) continue;
+        if (face_avg_z[f] < z_min) z_min = face_avg_z[f];
+        if (face_avg_z[f] > z_max) z_max = face_avg_z[f];
+    }
+    float z_range = (z_max - z_min > 1.0f) ? (z_max - z_min) : 1.0f;
+
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.border_width = 0;
+
+    for (int f = 0; f < ICO_FACES; f++) {
+        if (!face_front[f]) continue;
+
+        /* depth shade: closer = brighter blue, farther = darker */
+        float zt = 1.0f - (face_avg_z[f] - z_min) / z_range;  /* 1=close 0=far */
+        uint8_t rb = (uint8_t)(0x03 + (int)(zt * 0x08));
+        uint8_t gb = (uint8_t)(0x08 + (int)(zt * 0x14));
+        uint8_t bb = (uint8_t)(0x18 + (int)(zt * 0x28));
+        dsc.bg_color = lv_color_make(rb, gb, bb);
+        dsc.bg_opa   = LV_OPA_COVER;
+
+        /* convert from bg_circle-local to absolute screen coords */
+        lv_point_t abs_pts[3];
+        for (int i = 0; i < 3; i++) {
+            abs_pts[i].x = face_2d[f][i].x + coords.x1;
+            abs_pts[i].y = face_2d[f][i].y + coords.y1;
+        }
+
+        lv_draw_polygon(draw_ctx, &dsc, abs_pts, 3);
+    }
+}
+
 /* ── event handler (tap / long-press on the circle) ────────────── */
 static void circle_evt_cb(lv_event_t *e)
 {
@@ -402,6 +518,7 @@ void magic8ball_ui_init(lv_obj_t *parent, int screen_size)
     lv_obj_add_flag(bg_circle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_clip_corner(bg_circle, true, 0);
     lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(bg_circle, ico_face_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
 
     /* -- create bubble objects (behind icosahedron) -- */
     for (int i = 0; i < NUM_BUBBLES; i++) {
@@ -453,7 +570,7 @@ void magic8ball_ui_init(lv_obj_t *parent, int screen_size)
     /* -- answer text (centred inside icosahedron) -- */
     int text_w = (int)(ico_radius * 1.2f);
     answer_lbl = lv_label_create(bg_circle);
-    lv_label_set_text(answer_lbl, "SHAKE\nOR TAP");
+    lv_label_set_text(answer_lbl, "TAP TO\nASK");
     lv_obj_set_style_text_color(answer_lbl, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(answer_lbl, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_align(answer_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -492,6 +609,8 @@ void magic8ball_ui_set_answer(const char *text)
     /* Ensure anim timer is fully stopped (prevents crash if TTS blocks) */
     animating       = false;
     settling        = false;
+    settling_blend  = false;
+    blend_angle     = 0.0f;
     scale_animating = false;
     pending_spin    = false;
     visual_scale    = SETTLED_SCALE;
@@ -569,6 +688,8 @@ void magic8ball_ui_start_anim(void)
 {
     if (animating || pending_spin) return;
     settling        = false;
+    settling_blend  = false;
+    blend_angle     = 0.0f;
     settle_cb       = NULL;
     spin_angle      = 0;
     spin_rate       = 50;
@@ -599,6 +720,8 @@ void magic8ball_ui_stop_anim(void)
 {
     animating       = false;
     settling        = false;
+    settling_blend  = false;
+    blend_angle     = 0.0f;
     settle_cb       = NULL;
     pending_spin    = false;
     scale_animating = false;
@@ -630,7 +753,7 @@ void magic8ball_ui_stop_anim(void)
 /* ── decelerate spin then call done_cb ─────────────────────────── */
 void magic8ball_ui_settle_then(void (*done_cb)(void))
 {
-    if (!animating || spin_rate == 0) {
+    if (!animating && !pending_spin && !scale_animating) {
         magic8ball_ui_stop_anim();
         if (done_cb) done_cb();
         return;

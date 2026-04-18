@@ -31,8 +31,8 @@
 /* VAD tuning */
 #define VAD_WINDOW_MS       100
 #define VAD_WINDOW_SAMPLES  (SAMPLE_RATE * VAD_WINDOW_MS / 1000)   /* 1600 */
-#define VAD_SPEECH_THRESH   80        /* RMS threshold for speech           */
-#define VAD_SILENCE_MS      2000      /* 2 s silence → end of speech        */
+#define VAD_SPEECH_THRESH   60        /* RMS threshold for speech           */
+#define VAD_SILENCE_MS      3000      /* 3 s silence → end of speech        */
 #define VAD_MIN_SPEECH_MS   400       /* at least 0.4 s before allowing end */
 #define VAD_LOG_INTERVAL_MS 500       /* log RMS every 500 ms for debug     */
 

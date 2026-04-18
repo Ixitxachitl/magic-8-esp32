@@ -3,7 +3,7 @@
  *  Target: Waveshare ESP32-S3-Touch-AMOLED-1.75C
  *          CO5300 466×466 QSPI AMOLED
  *
- *  Tap the ball or shake the device → asks a free LLM for a mystical
+ *  Tap the ball → asks a free LLM for a mystical
  *  one-line answer displayed inside a classic blue-triangle window.
  */
 
@@ -13,7 +13,6 @@
 #include <lvgl.h>
 #include <math.h>
 #include "Arduino_GFX_Library.h"
-#include <SensorQMI8658.hpp>
 #include <TouchDrvCSTXXX.hpp>
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersAXP2101.tpp>
@@ -125,14 +124,6 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     }
 }
 
-/* ── IMU (shake detection) ─────────────────────────────────────── */
-SensorQMI8658 imu;
-static bool imu_ok = false;
-#define SHAKE_COOLDOWN_MS 2000
-#define SHAKE_JOLT_THRESH 0.5f    /* 0.5 g above baseline */
-static unsigned long last_shake_ms  = 0;
-static float         acc_baseline   = 0;
-
 /* ── Power button double-press detection ───────────────────────── */
 #define DOUBLE_PRESS_WINDOW_MS 600
 static unsigned long last_pkey_ms     = 0;
@@ -221,6 +212,10 @@ static void on_ask(void)
     if (use_llm && mic_ok) {
         tone_player_beep_listen();
         mic_recorder_start();
+        /* Drain any stale STT result from a previous session */
+        { String discard; while (stt_check_result(discard)) {} }
+        /* Drain any stale LLM result too */
+        { String discard; while (llm_check_result(discard)) {} }
         lvgl_lock();
         magic8ball_ui_set_listening(true);
         lvgl_unlock();
@@ -344,18 +339,6 @@ void setup()
     touch_ok = touch.begin(Wire, CST92XX_SLAVE_ADDRESS);
     Serial.printf("[INIT] Touch CST9217 %s\n", touch_ok ? "OK" : "FAIL");
 
-    /* ── IMU (accel only, for shake) ─────────────────────────── */
-    if (imu.begin(Wire, QMI8658_L_SLAVE_ADDRESS)) {
-        imu_ok = true;
-        imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
-                                SensorQMI8658::ACC_ODR_62_5Hz,
-                                SensorQMI8658::LPF_MODE_0);
-        imu.enableAccelerometer();
-        Serial.println("[INIT] IMU QMI8658 OK (accel 4G, 62.5Hz)");
-    } else {
-        Serial.println("[INIT] IMU QMI8658 NOT FOUND – shake disabled");
-    }
-
     /* ── LVGL ────────────────────────────────────────────────── */
     lv_init();
     Serial.println("[INIT] LVGL initialized");
@@ -456,7 +439,7 @@ void setup()
             }
         }
 
-        magic8ball_ui_set_answer("SHAKE\nOR TAP");
+        magic8ball_ui_set_answer("TAP TO\nASK");
     } else {
         Serial.println("[INIT] Not configured – showing AP setup screen");
         magic8ball_ui_set_answer("Connect WiFi:\nMagic8Ball\n-Setup\n192.168.4.1");
@@ -493,67 +476,59 @@ void loop()
             lvgl_unlock();
         }
 
-        /* fire partial STT every 3 s while enough audio exists */
-        if (millis() - last_partial_ms > 3000 &&
+        /* fire partial STT every 2 s while enough audio exists */
+        if (millis() - last_partial_ms > 2000 &&
             !stt_is_busy() &&
-            mic_recorder_get_sample_count() > 16000) {       /* >1 s */
+            mic_recorder_get_sample_count() > 8000) {        /* >0.5 s */
             Serial.println("[LOOP] Sending partial audio to STT...");
             stt_start_transcribe(mic_recorder_get_audio_buffer(),
                                  mic_recorder_get_sample_count());
             last_partial_ms = millis();
         }
 
-        /* speech ended → transition to final transcription */
-        if (mic_recorder_speech_ended()) {
-            Serial.println("[LOOP] Speech ended → TRANSCRIBING");
+        /* speech ended → always do final STT with complete audio */
+        bool timed_out = millis() - last_partial_ms > 8000;
+        if (mic_recorder_speech_ended() || timed_out) {
+            mic_recorder_stop();
             tone_player_beep_done();
 
-            /* If we already have a partial transcript, skip the final
-               STT round-trip and use it immediately – saves 2-4 seconds */
-            String last_partial;
-            stt_check_result(last_partial);   /* drain any pending result */
-            if (final_transcript.length() > 0 || last_partial.length() > 0) {
-                if (last_partial.length() > 0)
-                    final_transcript = last_partial;
-                Serial.printf("[LOOP] Using partial transcript: \"%s\"\n",
-                              final_transcript.c_str());
-                settle_complete = false;
-                lvgl_lock();
-                magic8ball_ui_settle_then(on_settle_done);
-                lvgl_unlock();
-                app_state = STATE_SETTLING_TRANSCRIPT;
-                Serial.println("[LOOP] → SETTLING_TRANSCRIPT (fast path)");
-            } else {
+            /* Drain any in-flight partial result – discard it */
+            String discard;
+            stt_check_result(discard);
+            final_transcript = "";
+
+            size_t samples = mic_recorder_get_sample_count();
+            if (samples > 1600) {   /* at least 0.1 s of audio */
+                Serial.printf("[LOOP] %s → TRANSCRIBING (%u samples)\n",
+                              timed_out ? "Timeout with audio" : "Speech ended",
+                              (unsigned)samples);
                 app_state       = STATE_TRANSCRIBING;
                 final_stt_sent  = false;
-                transcript_shown_ms = 0;
+                transcript_shown_ms = millis();
+            } else {
+                Serial.println("[LOOP] No usable audio – back to idle");
+                lvgl_lock();
+                magic8ball_ui_stop_anim();
+                magic8ball_ui_set_answer("TAP TO\nASK");
+                lvgl_unlock();
+                app_state = STATE_IDLE;
             }
-        }
-
-        /* timeout: back out if no speech for 8 seconds */
-        if (millis() - last_partial_ms > 8000 &&
-            mic_recorder_get_sample_count() < 16000) {
-            Serial.println("[LOOP] Listening timeout – no speech detected");
-            mic_recorder_stop();
-            lvgl_lock();
-            magic8ball_ui_stop_anim();
-            magic8ball_ui_set_answer("SHAKE\nOR TAP");
-            lvgl_unlock();
-            app_state = STATE_IDLE;
         }
         break;
     }
 
     case STATE_TRANSCRIBING: {
-        /* drain any in-flight partial result first */
-        String discard;
+        /* Wait for any in-flight partial to finish, then send full audio */
         if (!final_stt_sent) {
-            stt_check_result(discard);
+            String discard;
+            if (stt_check_result(discard)) {
+                /* partial finished – ignore it, send full audio now */
+            }
             if (!stt_is_busy()) {
                 stt_start_transcribe(mic_recorder_get_audio_buffer(),
                                      mic_recorder_get_sample_count());
                 final_stt_sent = true;
-                Serial.println("[LOOP] Final STT request sent");
+                Serial.println("[LOOP] Final STT request sent (full audio)");
             }
         } else {
             String text;
@@ -561,6 +536,8 @@ void loop()
                 if (text.length() > 0) {
                     Serial.printf("[LOOP] Final transcript: \"%s\"\n", text.c_str());
                     final_transcript = text;
+                    /* Fire LLM request immediately – runs during settle + display */
+                    llm_start_request_with_question(final_transcript);
                     /* settle spin before showing transcript */
                     settle_complete = false;
                     lvgl_lock();
@@ -578,6 +555,15 @@ void loop()
                 }
             }
         }
+        /* Safety timeout: 20s max waiting for STT */
+        if (millis() - transcript_shown_ms > 20000) {
+            Serial.println("[LOOP] STT timeout – back to idle");
+            lvgl_lock();
+            magic8ball_ui_stop_anim();
+            magic8ball_ui_set_answer("Timed out\ntry again");
+            lvgl_unlock();
+            app_state = STATE_IDLE;
+        }
         break;
     }
 
@@ -594,15 +580,30 @@ void loop()
     }
 
     case STATE_SHOWING_TRANSCRIPT: {
-        /* show transcript for 1.5 s, then resume spin and ask LLM */
-        if (millis() - transcript_shown_ms > 1500) {
-            lvgl_lock();
-            magic8ball_ui_start_anim();
-            magic8ball_ui_set_thinking(true);
-            lvgl_unlock();
-            llm_start_request_with_question(final_transcript);
-            app_state = STATE_ASKING_LLM;
-            Serial.println("[LOOP] → ASKING_LLM");
+        /* Show transcript for 2 seconds, then re-spin for LLM answer.
+           LLM request was already fired earlier. */
+        if (millis() - transcript_shown_ms > 2000) {
+            String early_answer;
+            if (llm_check_result(early_answer)) {
+                /* LLM already replied – settle straight to answer */
+                Serial.printf("[LOOP] LLM answered during transcript: \"%s\"\n",
+                              early_answer.c_str());
+                pending_answer = early_answer;
+                settle_complete = false;
+                lvgl_lock();
+                magic8ball_ui_start_anim();
+                magic8ball_ui_settle_then(on_settle_done);
+                lvgl_unlock();
+                app_state = STATE_SETTLING_ANSWER;
+                Serial.println("[LOOP] → SETTLING_ANSWER (fast)");
+            } else {
+                lvgl_lock();
+                magic8ball_ui_start_anim();
+                magic8ball_ui_set_thinking(true);
+                lvgl_unlock();
+                app_state = STATE_ASKING_LLM;
+                Serial.println("[LOOP] → ASKING_LLM");
+            }
         }
         break;
     }
@@ -660,34 +661,6 @@ void loop()
     }
 
     } /* end switch */
-
-    /* ── shake detection (any state == IDLE) ────────────────────── */
-    if (imu_ok) {
-        float ax, ay, az;
-        xSemaphoreTake(i2c_mux, portMAX_DELAY);
-        bool got = imu.getAccelerometer(ax, ay, az);
-        xSemaphoreGive(i2c_mux);
-        if (got) {
-            float mag = sqrtf(ax * ax + ay * ay + az * az);
-
-            /* Adaptive baseline: faster EMA so it settles quickly */
-            if (acc_baseline < 0.01f) acc_baseline = mag;
-            else acc_baseline = acc_baseline * 0.9f + mag * 0.1f;
-
-            float jolt = fabsf(mag - acc_baseline);
-
-            /* Trigger on fixed threshold (0.15 g above baseline) */
-            if (jolt > SHAKE_JOLT_THRESH) {
-                unsigned long now = millis();
-                if (now - last_shake_ms > SHAKE_COOLDOWN_MS &&
-                    app_state == STATE_IDLE) {
-                    last_shake_ms = now;
-                    Serial.printf("[LOOP] SHAKE! mag=%.2f jolt=%.2f\n", mag, jolt);
-                    on_ask();
-                }
-            }
-        }
-    }
 
     /* PMIC button: single press = wake screen, double press = AP setup */
     if (pmic_ok) {
