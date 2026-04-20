@@ -186,9 +186,13 @@ static void tts_bg_task(void *param)
 {
     (void)param;
     if (tts_task_buf) {
+        /* Re-read voice from config each time so portal changes apply live */
+        String voice = config_portal_get_tts_voice();
         if (tts_mode_str == "groq" || tts_mode_str == "openai") {
+            tts_groq_set_voice(voice);
             tts_groq_say(tts_task_buf);
         } else if (tts_mode_str == "elevenlabs") {
+            tts_elevenlabs_set_voice(voice);
             tts_elevenlabs_say(tts_task_buf);
         } else if (tts_mode_str == "sam") {
             tts_say(tts_task_buf);
