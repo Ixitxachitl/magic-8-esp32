@@ -89,6 +89,7 @@ static bool        animating    = false;
 static lv_timer_t *anim_timer   = NULL;
 static int         spin_angle   = 0;       /* 0.1-degree units           */
 static int         spin_rate    = 50;      /* 0.1 deg per tick           */
+static int         anim_frame   = 0;       /* frame counter for throttle */
 
 /* ── settle (deceleration) state ───────────────────────────────── */
 static bool        settling     = false;
@@ -266,6 +267,11 @@ static void anim_tick(lv_timer_t *t)
 {
     (void)t;
 
+    /* Suppress per-object invalidation for the entire tick.
+       We mark bg_circle dirty once at each exit point instead.     */
+    lv_disp_t *disp = lv_disp_get_default();
+    lv_disp_enable_invalidation(disp, false);
+
     /* --- scale animation (zoom in/out) runs before everything else --- */
     if (scale_animating) {
         /* If settle was requested during zoom-out, skip to spinning */
@@ -289,19 +295,25 @@ static void anim_tick(lv_timer_t *t)
             } else {
                 visual_scale += diff * 0.18f;
             }
-            show_settled_pose(visual_scale);
+            /* Use spin_angle (not settled pose) so zoom and spin are always in sync */
+            update_icosahedron(spin_angle);
+            lv_disp_enable_invalidation(disp, true);
+            lv_obj_invalidate(bg_circle);
             return;
         }
     }
 
-    if (!animating) return;
+    if (!animating) {
+        lv_disp_enable_invalidation(disp, true);
+        return;
+    }
 
     /* --- handle settling (unified: decel → blend+zoom) --- */
     if (settling) {
-        /* Decelerate spin quickly */
+        /* Decelerate spin smoothly */
         if (spin_rate > 0) {
-            spin_rate -= 6;
-            if (spin_rate < 0) spin_rate = 0;
+            spin_rate = (int)(spin_rate * 0.88f);
+            if (spin_rate < 2) spin_rate = 0;
             /* Still spinning – fall through to normal spin/bubble code */
         }
 
@@ -309,8 +321,10 @@ static void anim_tick(lv_timer_t *t)
             /* Spin stopped – enter or continue blend phase */
             if (!settling_blend) {
                 settling_blend = true;
-                blend_angle = (float)spin_angle;
+                /* Normalize spin_angle to shortest path to nearest 0 mod 3600 */
+                blend_angle = (float)(spin_angle % 3600);
                 if (blend_angle > 1800.0f) blend_angle -= 3600.0f;
+                if (blend_angle < -1800.0f) blend_angle += 3600.0f;
                 /* hide bubbles, restore default edge colour */
                 for (int i = 0; i < NUM_BUBBLES; i++) {
                     lv_obj_add_flag(bubbles[i].obj, LV_OBJ_FLAG_HIDDEN);
@@ -321,15 +335,15 @@ static void anim_tick(lv_timer_t *t)
             }
 
             /* Ease blend_angle toward 0 */
-            float step = blend_angle * 0.25f;
-            float max_step = 80.0f;
+            float step = blend_angle * 0.35f;
+            float max_step = 120.0f;
             if (step >  max_step) step =  max_step;
             if (step < -max_step) step = -max_step;
             blend_angle -= step;
 
             /* Simultaneously ease scale toward SETTLED_SCALE */
             float sdiff = SETTLED_SCALE - visual_scale;
-            visual_scale += sdiff * 0.18f;
+            visual_scale += sdiff * 0.25f;
 
             /* Check if both rotation and scale are done */
             bool angle_done = fabsf(blend_angle) < 2.0f;
@@ -345,6 +359,8 @@ static void anim_tick(lv_timer_t *t)
                 settle_cb = NULL;
                 show_settled_pose(SETTLED_SCALE);
                 if (anim_timer) lv_timer_pause(anim_timer);
+                lv_disp_enable_invalidation(disp, true);
+                lv_obj_invalidate(bg_circle);
                 if (cb) cb();
             } else {
                 float a = angle_done ? 0.0f : blend_angle;
@@ -352,6 +368,8 @@ static void anim_tick(lv_timer_t *t)
                     SETTLE_RY + a * (float)M_PI / 1800.0f,
                     SETTLE_RX + a * (float)M_PI / 1800.0f * 0.37f,
                     visual_scale);
+                lv_disp_enable_invalidation(disp, true);
+                lv_obj_invalidate(bg_circle);
             }
             return;
         }
@@ -359,19 +377,23 @@ static void anim_tick(lv_timer_t *t)
     }
 
     /* --- spin icosahedron --- */
-    spin_angle = (spin_angle + spin_rate) % 3600;
+    spin_angle += spin_rate;
     update_icosahedron(spin_angle);
+    anim_frame++;
 
-    /* --- subtle colour pulse on all edges --- */
-    float pulse = (sinf((float)spin_angle * M_PI / 1800.0f) + 1.0f) / 2.0f;
-    uint8_t r = (uint8_t)(0x10 + pulse * 0x20);
-    uint8_t g = (uint8_t)(0x40 + pulse * 0x30);
-    uint8_t b = (uint8_t)(0x70 + pulse * 0x30);
-    for (int e = 0; e < ICO_EDGES; e++)
-        lv_obj_set_style_line_color(ico_line[e], lv_color_make(r, g, b), 0);
+    /* --- subtle colour pulse on all edges (every 4th frame) --- */
+    if ((anim_frame & 3) == 0) {
+        float pulse = (sinf((float)spin_angle * M_PI / 1800.0f) + 1.0f) / 2.0f;
+        uint8_t r = (uint8_t)(0x10 + pulse * 0x20);
+        uint8_t g = (uint8_t)(0x40 + pulse * 0x30);
+        uint8_t b = (uint8_t)(0x70 + pulse * 0x30);
+        for (int e = 0; e < ICO_EDGES; e++)
+            lv_obj_set_style_line_color(ico_line[e], lv_color_make(r, g, b), 0);
+    }
 
     /* --- bubble management --- */
     float half = (float)circle_d / 2.0f;
+    float kill_r2 = 40.0f * 40.0f;   /* squared kill radius (avoids sqrtf) */
     for (int i = 0; i < NUM_BUBBLES; i++) {
         if (!bubbles[i].active) continue;
 
@@ -383,8 +405,8 @@ static void anim_tick(lv_timer_t *t)
 
         float dx = bubbles[i].x - half;
         float dy = bubbles[i].y - half;
-        float dist = sqrtf(dx * dx + dy * dy);
-        if (bubbles[i].life <= 0 || dist < 40.0f) {
+        float dist2 = dx * dx + dy * dy;
+        if (bubbles[i].life <= 0 || dist2 < kill_r2) {
             lv_obj_add_flag(bubbles[i].obj, LV_OBJ_FLAG_HIDDEN);
             bubbles[i].active = false;
             continue;
@@ -407,9 +429,9 @@ static void anim_tick(lv_timer_t *t)
                 float by = half + sinf(angle) * edge_r;
                 float nx = half - bx;
                 float ny = half - by;
-                float len = sqrtf(nx * nx + ny * ny);
-                if (len < 1.0f) len = 1.0f;
-                nx /= len; ny /= len;
+                /* edge_r is always the length, skip sqrtf */
+                float inv_len = 1.0f / (edge_r > 1.0f ? edge_r : 1.0f);
+                nx *= inv_len; ny *= inv_len;
 
                 int sz = 5 + (rand() % 8);
                 int life = 50 + (rand() % 40);
@@ -431,6 +453,10 @@ static void anim_tick(lv_timer_t *t)
             }
         }
     }
+
+    /* Re-enable invalidation and mark the circle dirty once */
+    lv_disp_enable_invalidation(disp, true);
+    lv_obj_invalidate(bg_circle);
 }
 
 /* ── draw event: filled dark-blue triangles for front-facing faces ─ */
@@ -631,8 +657,7 @@ void magic8ball_ui_set_thinking(bool thinking)
     is_thinking = thinking;
 
     if (thinking) {
-        spin_rate = 35;
-        /* hide all text while spinning */
+        /* just hide all text – spinning is the only indicator */
         lv_obj_add_flag(answer_lbl,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(thinking_lbl, LV_OBJ_FLAG_HIDDEN);
         if (think_tmr) { lv_timer_del(think_tmr); think_tmr = NULL; }
@@ -658,11 +683,9 @@ void magic8ball_ui_set_listening(bool listening)
     }
 }
 
-/* ── show transcription text (only when settled) ───────────────── */
+/* ── show transcription text (works during spin too) ───────────── */
 void magic8ball_ui_set_transcript(const char *text)
 {
-    if (animating) return;   /* no text while spinning */
-
     lv_obj_clear_flag(answer_lbl, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(answer_lbl, text);
 
@@ -691,7 +714,7 @@ void magic8ball_ui_start_anim(void)
     settling_blend  = false;
     blend_angle     = 0.0f;
     settle_cb       = NULL;
-    spin_angle      = 0;
+    spin_angle      = 0;    /* settled pose = spin_angle 0 */
     spin_rate       = 50;
     bubble_spawn_cd = 0;
 

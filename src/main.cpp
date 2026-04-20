@@ -26,6 +26,7 @@
 #include "tone_player.h"
 #include "tts_sam.h"
 #include "tts_groq.h"
+#include "tts_elevenlabs.h"
 #include <esp_task_wdt.h>
 
 /* ── Classic Magic 8 Ball fallback answers (no-WiFi mode) ──────── */
@@ -56,7 +57,7 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 
 /* ── LVGL buffers ──────────────────────────────────────────────── */
 static const uint32_t LV_BUF_SIZE    = LCD_WIDTH * LCD_HEIGHT;
-static const uint32_t STAGING_LINES  = 40;
+static const uint32_t STAGING_LINES  = 120;
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1    = nullptr;
 static lv_color_t *staging = nullptr;
@@ -128,6 +129,9 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 #define DOUBLE_PRESS_WINDOW_MS 600
 static unsigned long last_pkey_ms     = 0;
 static int           pkey_press_count = 0;
+static bool          pkey_single_pending = false;   /* waiting for double-press window */
+static unsigned long batt_display_ms    = 0;        /* when battery % was shown        */
+static bool          showing_battery    = false;
 
 /* ── PMIC ──────────────────────────────────────────────────────── */
 XPowersAXP2101 pmic;
@@ -144,7 +148,7 @@ static void lvgl_task(void *param)
             lv_timer_handler();
             xSemaphoreGiveRecursive(lvgl_mux);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -181,8 +185,10 @@ static void tts_bg_task(void *param)
 {
     (void)param;
     if (tts_task_buf) {
-        if (tts_mode_str == "groq") {
+        if (tts_mode_str == "groq" || tts_mode_str == "openai") {
             tts_groq_say(tts_task_buf);
+        } else if (tts_mode_str == "elevenlabs") {
+            tts_elevenlabs_say(tts_task_buf);
         } else if (tts_mode_str == "sam") {
             tts_say(tts_task_buf);
         }
@@ -407,11 +413,23 @@ void setup()
                      key,
                      config_portal_get_model());
             llm_set_system_prompt(config_portal_get_system_prompt());
-            stt_init(config_portal_get_api_url(), key);
             use_llm = true;
-            Serial.println("[INIT] LLM + STT mode ENABLED (online)");
+            Serial.println("[INIT] LLM mode ENABLED (online)");
         } else {
             Serial.println("[INIT] No API key – classic offline mode");
+        }
+
+        /* ── STT init (may use a different provider than LLM) ──── */
+        String stt_prov = config_portal_get_stt_provider();
+        {
+            String stt_url = config_portal_get_stt_url();
+            String stt_key = config_portal_get_stt_key();
+            if (stt_key.length() > 0 && stt_url.length() > 0) {
+                stt_init(stt_url, stt_key);
+                Serial.printf("[INIT] STT: %s\n", stt_prov.c_str());
+            } else {
+                Serial.printf("[INIT] STT provider '%s' has no key – disabled\n", stt_prov.c_str());
+            }
         }
 
         /* ── Microphone (ES8311) ─────────────────────────────── */
@@ -425,11 +443,35 @@ void setup()
 
             /* ── TTS engine selection ────────────────────────── */
             tts_mode_str = config_portal_get_tts_mode();
-            if (tts_mode_str == "groq" && use_llm) {
-                tts_groq_init(config_portal_get_api_url(),
-                              config_portal_get_api_key());
-                tts_groq_set_voice(config_portal_get_tts_voice());
-                Serial.println("[INIT] TTS: Groq Orpheus");
+            if (tts_mode_str == "groq" || tts_mode_str == "openai") {
+                String tts_key = config_portal_get_tts_key();
+                if (tts_key.length() > 0) {
+                    tts_groq_init(config_portal_get_tts_url(), tts_key);
+                    tts_groq_set_voice(config_portal_get_tts_voice());
+                    if (tts_mode_str == "openai") {
+                        tts_groq_set_model("tts-1");
+                        Serial.println("[INIT] TTS: OpenAI");
+                    } else {
+                        tts_groq_set_model("canopylabs/orpheus-v1-english");
+                        Serial.println("[INIT] TTS: Groq Orpheus");
+                    }
+                } else {
+                    tts_mode_str = "sam";
+                    tts_init();
+                    Serial.printf("[INIT] TTS: %s key missing, falling back to SAM\n",
+                                  config_portal_get_tts_mode().c_str());
+                }
+            } else if (tts_mode_str == "elevenlabs") {
+                String tts_key = config_portal_get_tts_key();
+                if (tts_key.length() > 0) {
+                    tts_elevenlabs_init(tts_key);
+                    tts_elevenlabs_set_voice(config_portal_get_tts_voice());
+                    Serial.println("[INIT] TTS: ElevenLabs");
+                } else {
+                    tts_mode_str = "sam";
+                    tts_init();
+                    Serial.println("[INIT] TTS: ElevenLabs key missing, falling back to SAM");
+                }
             } else if (tts_mode_str != "off") {
                 tts_mode_str = "sam";
                 tts_init();
@@ -492,12 +534,32 @@ void loop()
             mic_recorder_stop();
             tone_player_beep_done();
 
+            size_t samples = mic_recorder_get_sample_count();
+
+            /* If we already have a partial transcript, use it directly
+               instead of waiting for the slow final round-trip */
+            if (final_transcript.length() > 0) {
+                /* Cancel in-flight partial (result will be discarded) */
+                String discard;
+                stt_check_result(discard);
+                Serial.printf("[LOOP] Using partial transcript: \"%s\"\n",
+                              final_transcript.c_str());
+                /* Settle spin to show transcript */
+                settle_complete = false;
+                lvgl_lock();
+                magic8ball_ui_settle_then(on_settle_done);
+                lvgl_unlock();
+                app_state = STATE_SETTLING_TRANSCRIPT;
+                Serial.println("[LOOP] → SETTLING_TRANSCRIPT (fast path)");
+                break;
+            }
+
+            /* No partial available – need full transcription */
             /* Drain any in-flight partial result – discard it */
             String discard;
             stt_check_result(discard);
             final_transcript = "";
 
-            size_t samples = mic_recorder_get_sample_count();
             if (samples > 1600) {   /* at least 0.1 s of audio */
                 Serial.printf("[LOOP] %s → TRANSCRIBING (%u samples)\n",
                               timed_out ? "Timeout with audio" : "Speech ended",
@@ -520,14 +582,27 @@ void loop()
     case STATE_TRANSCRIBING: {
         /* Wait for any in-flight partial to finish, then send full audio */
         if (!final_stt_sent) {
-            String discard;
-            if (stt_check_result(discard)) {
-                /* partial finished – ignore it, send full audio now */
+            String partial;
+            if (stt_check_result(partial)) {
+                /* Partial finished — if it has content, use it directly
+                   instead of sending the full (much larger) audio again */
+                if (partial.length() > 0) {
+                    Serial.printf("[LOOP] Using partial result: \"%s\"\n", partial.c_str());
+                    final_transcript = partial;
+                    settle_complete = false;
+                    lvgl_lock();
+                    magic8ball_ui_settle_then(on_settle_done);
+                    lvgl_unlock();
+                    app_state = STATE_SETTLING_TRANSCRIPT;
+                    Serial.println("[LOOP] → SETTLING_TRANSCRIPT (from partial)");
+                    break;
+                }
             }
             if (!stt_is_busy()) {
                 stt_start_transcribe(mic_recorder_get_audio_buffer(),
                                      mic_recorder_get_sample_count());
                 final_stt_sent = true;
+                transcript_shown_ms = millis();  /* reset timeout for final request */
                 Serial.println("[LOOP] Final STT request sent (full audio)");
             }
         } else {
@@ -536,9 +611,7 @@ void loop()
                 if (text.length() > 0) {
                     Serial.printf("[LOOP] Final transcript: \"%s\"\n", text.c_str());
                     final_transcript = text;
-                    /* Fire LLM request immediately – runs during settle + display */
-                    llm_start_request_with_question(final_transcript);
-                    /* settle spin before showing transcript */
+                    /* Settle spin to show transcript */
                     settle_complete = false;
                     lvgl_lock();
                     magic8ball_ui_settle_then(on_settle_done);
@@ -580,30 +653,15 @@ void loop()
     }
 
     case STATE_SHOWING_TRANSCRIPT: {
-        /* Show transcript for 2 seconds, then re-spin for LLM answer.
-           LLM request was already fired earlier. */
-        if (millis() - transcript_shown_ms > 2000) {
-            String early_answer;
-            if (llm_check_result(early_answer)) {
-                /* LLM already replied – settle straight to answer */
-                Serial.printf("[LOOP] LLM answered during transcript: \"%s\"\n",
-                              early_answer.c_str());
-                pending_answer = early_answer;
-                settle_complete = false;
-                lvgl_lock();
-                magic8ball_ui_start_anim();
-                magic8ball_ui_settle_then(on_settle_done);
-                lvgl_unlock();
-                app_state = STATE_SETTLING_ANSWER;
-                Serial.println("[LOOP] → SETTLING_ANSWER (fast)");
-            } else {
-                lvgl_lock();
-                magic8ball_ui_start_anim();
-                magic8ball_ui_set_thinking(true);
-                lvgl_unlock();
-                app_state = STATE_ASKING_LLM;
-                Serial.println("[LOOP] → ASKING_LLM");
-            }
+        /* Show transcript briefly, then re-spin and send to LLM */
+        if (millis() - transcript_shown_ms > 1500) {
+            /* Fire LLM request now */
+            llm_start_request_with_question(final_transcript);
+            lvgl_lock();
+            magic8ball_ui_start_anim();
+            lvgl_unlock();
+            app_state = STATE_ASKING_LLM;
+            Serial.println("[LOOP] → ASKING_LLM");
         }
         break;
     }
@@ -662,7 +720,7 @@ void loop()
 
     } /* end switch */
 
-    /* PMIC button: single press = wake screen, double press = AP setup */
+    /* PMIC button: single press = show battery, double press = AP setup */
     if (pmic_ok) {
         xSemaphoreTake(i2c_mux, portMAX_DELAY);
         pmic.getIrqStatus();
@@ -674,8 +732,10 @@ void loop()
             gfx->setBrightness(200);
             if (now - last_pkey_ms < DOUBLE_PRESS_WINDOW_MS) {
                 pkey_press_count++;
+                pkey_single_pending = false;   /* cancel single-press action */
             } else {
                 pkey_press_count = 1;
+                pkey_single_pending = true;
             }
             last_pkey_ms = now;
             if (pkey_press_count >= 2) {
@@ -683,6 +743,36 @@ void loop()
                 pkey_press_count = 0;
                 on_longpress();
             }
+        }
+
+        /* Single-press confirmed (double-press window expired) */
+        if (pkey_single_pending &&
+            millis() - last_pkey_ms >= DOUBLE_PRESS_WINDOW_MS) {
+            pkey_single_pending = false;
+            if (app_state == STATE_IDLE && !tts_playing) {
+                xSemaphoreTake(i2c_mux, portMAX_DELAY);
+                int pct = pmic.getBatteryPercent();
+                float volts = pmic.getBattVoltage() / 1000.0f;
+                bool charging = pmic.isCharging();
+                xSemaphoreGive(i2c_mux);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "Battery\n%d%%\n%.2fV%s",
+                         pct, volts, charging ? "\n(charging)" : "");
+                lvgl_lock();
+                magic8ball_ui_set_answer(buf);
+                lvgl_unlock();
+                showing_battery = true;
+                batt_display_ms = millis();
+                Serial.printf("[LOOP] Battery: %d%% %.2fV\n", pct, volts);
+            }
+        }
+
+        /* Revert battery display back to idle prompt after 2 seconds */
+        if (showing_battery && millis() - batt_display_ms > 2000) {
+            showing_battery = false;
+            lvgl_lock();
+            magic8ball_ui_set_answer("TAP TO\nASK");
+            lvgl_unlock();
         }
     }
 

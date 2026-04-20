@@ -20,6 +20,7 @@
 static String cfg_url;
 static String cfg_key;
 static String cfg_voice = "tara";
+static String cfg_model = "canopylabs/orpheus-v1-english";
 
 static I2SClass *s_i2s = nullptr;
 
@@ -200,6 +201,12 @@ void tts_groq_set_voice(const String &voice)
     Serial.printf("[TTS-GROQ] Voice set to: %s\n", cfg_voice.c_str());
 }
 
+void tts_groq_set_model(const String &model)
+{
+    if (model.length() > 0) cfg_model = model;
+    Serial.printf("[TTS-GROQ] Model set to: %s\n", cfg_model.c_str());
+}
+
 void tts_groq_say(const char *text)
 {
     if (!s_i2s || !s_i2s->txChan() || !text || !text[0]) return;
@@ -219,7 +226,7 @@ void tts_groq_say(const char *text)
 
     /* Build JSON body */
     JsonDocument doc;
-    doc["model"] = "canopylabs/orpheus-v1-english";
+    doc["model"] = cfg_model;
     doc["input"] = clean;
     doc["voice"] = cfg_voice;
     doc["response_format"] = "wav";

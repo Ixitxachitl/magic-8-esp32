@@ -14,6 +14,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <vector>
+#include <algorithm>
 
 static WebServer  web(80);
 static DNSServer  dns;
@@ -29,14 +31,43 @@ static String api_url;
 static String api_key;
 static String model_name;
 static String system_prompt;
-static String tts_mode;         /* "sam", "groq", "off" */
-static String tts_voice;        /* Groq voice: tara, troy, autumn, etc. */
+static String tts_mode;         /* "sam", "groq", "openai", "elevenlabs", "off" */
+static String tts_voice;        /* voice name or ElevenLabs voice_id */
+
+/* per-service API keys */
+static String key_groq;
+static String key_gemini;
+static String key_openai;
+static String key_elevenlabs;
+static String key_custom;
+static String custom_url;       /* user-supplied base URL for "custom" */
+
+/* provider selections */
+static String llm_provider;     /* "groq", "gemini", "openai", "custom" */
+static String stt_provider;     /* "groq", "openai" */
 
 static const char DEFAULT_SYS_PROMPT[] =
     "You are a mystical Magic 8 Ball. Give a brief, mysterious answer "
     "to whatever the user is wondering about. Keep your response to "
     "one short sentence (under 10 words). Be creative and mystical. "
     "Do not use quotes. Do not explain yourself. Just give the answer.";
+
+/* ── provider URL table ────────────────────────────────────────── */
+static String url_for_provider(const String &prov) {
+    if (prov == "groq")   return "https://api.groq.com/openai/v1";
+    if (prov == "gemini") return "https://generativelanguage.googleapis.com/v1beta/openai";
+    if (prov == "openai") return "https://api.openai.com/v1";
+    if (prov == "custom") return custom_url;
+    return "";
+}
+
+static String key_for_provider(const String &prov) {
+    if (prov == "groq")   return key_groq;
+    if (prov == "gemini") return key_gemini;
+    if (prov == "openai") return key_openai;
+    if (prov == "custom") return key_custom;
+    return "";
+}
 
 /* helper: HTML-escape a string */
 static String htmlEscape(const String &s) {
@@ -83,6 +114,12 @@ textarea{resize:vertical;font-size:14px}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid #555;
          border-top:2px solid #4488cc;border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+table.keys{width:100%;border-collapse:collapse;margin-top:8px}
+table.keys th{text-align:left;font-size:13px;color:#77a;padding:6px 4px;border-bottom:1px solid #222}
+table.keys td{padding:4px}
+table.keys td:first-child{width:90px;font-size:14px;color:#bbc;padding-left:4px}
+table.keys input{margin-top:0;font-size:14px;padding:8px}
+.custom-row{display:none}
 </style></head><body>
 <div class="c">
 <h1>&#x1F3B1; Magic 8 Ball</h1>
@@ -104,14 +141,33 @@ textarea{resize:vertical;font-size:14px}
 <button class="btn btn-blue" type="button" onclick="saveWifi()">Save WiFi &amp; Reboot</button>
 <p id="wifi_msg" class="msg" style="color:#4a8"></p>
 
-<!-- ═══════ API Section ═══════ -->
-<h2>&#x1F527; API Settings</h2>
-<label>LLM API Base URL</label>
-<input id="api_url" value="{{API_URL}}" placeholder="https://api.groq.com/openai/v1">
-<p class="note">Any OpenAI-compatible API. Groq free tier is the default.</p>
-<label>API Key</label>
-<input id="api_key" type="password" value="{{API_KEY}}" placeholder="gsk_...">
-<p class="note">Get a free key at <b>console.groq.com</b></p>
+<!-- ═══════ API Keys ═══════ -->
+<h2>&#x1F511; API Keys</h2>
+<p class="note">Add keys for each service you want to use. Only services with keys will appear in the provider dropdowns.</p>
+<table class="keys">
+<tr><th>Service</th><th>API Key</th></tr>
+<tr><td>Groq</td><td><input id="key_groq" type="password" value="{{KEY_GROQ}}" placeholder="gsk_..."></td></tr>
+<tr><td>Gemini</td><td><input id="key_gemini" type="password" value="{{KEY_GEMINI}}" placeholder="AIza..."></td></tr>
+<tr><td>OpenAI</td><td><input id="key_openai" type="password" value="{{KEY_OPENAI}}" placeholder="sk-..."></td></tr>
+<tr><td>ElevenLabs</td><td><input id="key_elevenlabs" type="password" value="{{KEY_11L}}" placeholder="xi-..."></td></tr>
+<tr><td>Custom</td><td><input id="key_custom" type="password" value="{{KEY_CUSTOM}}" placeholder="key for custom URL"></td></tr>
+</table>
+<div id="custom_url_row" class="custom-row">
+<label>Custom API Base URL</label>
+<input id="custom_url" value="{{CUSTOM_URL}}" placeholder="https://your-api.example.com/v1">
+</div>
+<button class="btn btn-blue" type="button" onclick="saveKeys()">Save API Keys</button>
+<p id="keys_msg" class="msg" style="color:#4a8"></p>
+
+<!-- ═══════ Provider Selection ═══════ -->
+<h2>&#x1F527; Provider Settings</h2>
+<label>LLM Provider</label>
+<select id="llm_provider">
+  <option value="groq" {{LP_GROQ}}>Groq</option>
+  <option value="gemini" {{LP_GEMINI}}>Gemini</option>
+  <option value="openai" {{LP_OPENAI}}>OpenAI</option>
+  <option value="custom" {{LP_CUSTOM}}>Custom</option>
+</select>
 <div class="row">
   <div>
     <label>Model</label>
@@ -122,16 +178,27 @@ textarea{resize:vertical;font-size:14px}
   <button class="btn btn-teal btn-sm" type="button" onclick="scanModels()"
     style="width:90px;margin-bottom:1px" id="modelBtn">Scan</button>
 </div>
-<p class="note" id="model_note">Click Scan to fetch available models from the API.</p>
+<p class="note" id="model_note">Click Scan to fetch available models from the selected LLM provider.</p>
+
+<label>STT Provider (Speech-to-Text)</label>
+<select id="stt_provider">
+  <option value="groq" {{SP_GROQ}}>Groq (Whisper)</option>
+  <option value="openai" {{SP_OPENAI}}>OpenAI (Whisper)</option>
+
+</select>
+<p class="note">STT uses the Whisper API. Groq and OpenAI are supported.</p>
 
 <h2>&#x1F50A; Text-to-Speech</h2>
 <label>TTS Engine</label>
-<select id="tts_mode">
+<select id="tts_mode" onchange="updateTtsVoices()">
   <option value="sam" {{SEL_SAM}}>SAM (offline, robotic)</option>
   <option value="groq" {{SEL_GROQ}}>Groq Orpheus (online, natural)</option>
+  <option value="openai" {{SEL_OPENAI}}>OpenAI TTS (online, natural)</option>
+  <option value="elevenlabs" {{SEL_11L}}>ElevenLabs (online, many voices)</option>
   <option value="off" {{SEL_OFF}}>Off</option>
 </select>
-<p class="note">SAM runs locally. Groq uses your API key (free tier: 100 req/day).</p>
+<p class="note">SAM runs locally. Others use their respective API key.</p>
+<div id="groq_voice_row">
 <label>Groq TTS Voice</label>
 <select id="tts_voice">
   <option value="tara" {{V_TARA}}>Tara (Female)</option>
@@ -142,9 +209,39 @@ textarea{resize:vertical;font-size:14px}
   <option value="austin" {{V_AUSTIN}}>Austin (Male)</option>
   <option value="daniel" {{V_DANIEL}}>Daniel (Male)</option>
 </select>
-<p class="note">Only used when TTS Engine is set to Groq.</p>
+</div>
+<div id="openai_voice_row" style="display:none">
+<label>OpenAI TTS Voice</label>
+<select id="tts_voice_openai">
+  <option value="alloy" {{OV_ALLOY}}>Alloy (Neutral)</option>
+  <option value="ash" {{OV_ASH}}>Ash (Male)</option>
+  <option value="coral" {{OV_CORAL}}>Coral (Female)</option>
+  <option value="echo" {{OV_ECHO}}>Echo (Male)</option>
+  <option value="fable" {{OV_FABLE}}>Fable (Male, British)</option>
+  <option value="nova" {{OV_NOVA}}>Nova (Female)</option>
+  <option value="onyx" {{OV_ONYX}}>Onyx (Male, deep)</option>
+  <option value="sage" {{OV_SAGE}}>Sage (Female)</option>
+  <option value="shimmer" {{OV_SHIMMER}}>Shimmer (Female)</option>
+</select>
+</div>
+<div id="elevenlabs_voice_row" style="display:none">
+<label>ElevenLabs Voice</label>
+<select id="tts_voice_11l">
+  <option value="21m00Tcm4TlvDq8ikWAM" {{EV_RACHEL}}>Rachel (Female, warm)</option>
+  <option value="pNInz6obpgDQGcFmaJgB" {{EV_ADAM}}>Adam (Male, deep)</option>
+  <option value="EXAVITQu4vr4xnSDxMaL" {{EV_BELLA}}>Bella (Female, young)</option>
+  <option value="ErXwobaYiN019PkySvjV" {{EV_ANTONI}}>Antoni (Male, crisp)</option>
+  <option value="VR6AewLTigWG4xSOukaG" {{EV_ARNOLD}}>Arnold (Male, gruff)</option>
+  <option value="MF3mGyEYCl7XYWbV9V6O" {{EV_ELLI}}>Elli (Female, child-like)</option>
+  <option value="TxGEqnHWrfWFTfGW9XjX" {{EV_JOSH}}>Josh (Male, warm)</option>
+  <option value="yoZ06aMxZJJ28mfd3POQ" {{EV_SAM}}>Sam (Male, raspy)</option>
+</select>
+<label>Or paste a custom Voice ID:</label>
+<input id="tts_voice_11l_custom" value="{{EV_CUSTOM}}" placeholder="e.g. abc123def456">
+<p class="note">Browse voices at elevenlabs.io/voice-library</p>
+</div>
 
-<button class="btn btn-blue" type="button" onclick="saveApi()">Save API Settings</button>
+<button class="btn btn-blue" type="button" onclick="saveProviders()">Save Provider Settings</button>
 <p id="api_msg" class="msg" style="color:#4a8"></p>
 
 <!-- ═══════ Prompt Section ═══════ -->
@@ -155,6 +252,12 @@ textarea{resize:vertical;font-size:14px}
 <p id="prompt_msg" class="msg" style="color:#4a8"></p>
 
 <script>
+var providerUrls={
+  groq:'https://api.groq.com/openai/v1',
+  gemini:'https://generativelanguage.googleapis.com/v1beta/openai',
+  openai:'https://api.openai.com/v1',
+  custom:''
+};
 function postForm(url,data,msgEl,okMsg){
   msgEl.style.color='#4a8'; msgEl.textContent='Saving...';
   fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data})
@@ -169,13 +272,30 @@ function saveWifi(){
   postForm('/save_wifi','ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p),
            document.getElementById('wifi_msg'),'Saved! Rebooting...');
 }
-function saveApi(){
-  var d='api_url='+encodeURIComponent(document.getElementById('api_url').value)
-       +'&api_key='+encodeURIComponent(document.getElementById('api_key').value)
+function saveKeys(){
+  var d='key_groq='+encodeURIComponent(document.getElementById('key_groq').value)
+       +'&key_gemini='+encodeURIComponent(document.getElementById('key_gemini').value)
+       +'&key_openai='+encodeURIComponent(document.getElementById('key_openai').value)
+       +'&key_elevenlabs='+encodeURIComponent(document.getElementById('key_elevenlabs').value)
+       +'&key_custom='+encodeURIComponent(document.getElementById('key_custom').value)
+       +'&custom_url='+encodeURIComponent(document.getElementById('custom_url').value);
+  postForm('/save_keys',d,document.getElementById('keys_msg'),'API keys saved!');
+}
+function saveProviders(){
+  var ttsMode=document.getElementById('tts_mode').value;
+  var voice='';
+  if(ttsMode==='groq') voice=document.getElementById('tts_voice').value;
+  else if(ttsMode==='openai') voice=document.getElementById('tts_voice_openai').value;
+  else if(ttsMode==='elevenlabs'){
+    var cv=document.getElementById('tts_voice_11l_custom').value.trim();
+    voice=cv.length>0?cv:document.getElementById('tts_voice_11l').value;
+  }
+  var d='llm_provider='+encodeURIComponent(document.getElementById('llm_provider').value)
        +'&model='+encodeURIComponent(document.getElementById('model_sel').value)
-       +'&tts_mode='+encodeURIComponent(document.getElementById('tts_mode').value)
-       +'&tts_voice='+encodeURIComponent(document.getElementById('tts_voice').value);
-  postForm('/save_api',d,document.getElementById('api_msg'),'Saved!');
+       +'&stt_provider='+encodeURIComponent(document.getElementById('stt_provider').value)
+       +'&tts_mode='+encodeURIComponent(ttsMode)
+       +'&tts_voice='+encodeURIComponent(voice);
+  postForm('/save_api',d,document.getElementById('api_msg'),'Provider settings saved!');
 }
 function savePrompt(){
   postForm('/save_prompt','sys_prompt='+encodeURIComponent(document.getElementById('sys_prompt').value),
@@ -201,13 +321,22 @@ function scanWifi(){
     btn.disabled=false;btn.textContent='Scan';
   }).catch(function(e){btn.disabled=false;btn.textContent='Scan';alert('Scan failed: '+e);});
 }
+function getActiveUrl(){
+  var prov=document.getElementById('llm_provider').value;
+  if(prov==='custom') return document.getElementById('custom_url').value;
+  return providerUrls[prov]||'';
+}
+function getActiveKey(){
+  var prov=document.getElementById('llm_provider').value;
+  return document.getElementById('key_'+prov).value;
+}
 function scanModels(){
   var btn=document.getElementById('modelBtn');
   var note=document.getElementById('model_note');
   btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
   note.textContent='Fetching models...';
-  var url=document.getElementById('api_url').value;
-  var key=document.getElementById('api_key').value;
+  var url=getActiveUrl();
+  var key=getActiveKey();
   fetch('/scan_models?api_url='+encodeURIComponent(url)+'&api_key='+encodeURIComponent(key))
     .then(function(r){return r.json()})
     .then(function(list){
@@ -225,6 +354,29 @@ function scanModels(){
       note.textContent='Found '+list.length+' models.';
     }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
 }
+/* show/hide custom URL row */
+function updateCustom(){
+  var v=document.getElementById('llm_provider').value;
+  document.getElementById('custom_url_row').style.display=(v==='custom')?'block':'none';
+  var kc=document.getElementById('key_custom').closest('tr');
+  if(kc)kc.style.display=(v==='custom')?'':'none';
+}
+document.getElementById('llm_provider').addEventListener('change',updateCustom);
+document.getElementById('key_custom').addEventListener('input',function(){
+  if(this.value.length>0){
+    var p=document.getElementById('llm_provider');
+    var opts=p.querySelectorAll('option');
+    for(var i=0;i<opts.length;i++) if(opts[i].value==='custom'){opts[i].style.display='';return;}
+  }
+});
+updateCustom();
+function updateTtsVoices(){
+  var m=document.getElementById('tts_mode').value;
+  document.getElementById('groq_voice_row').style.display=(m==='groq')?'block':'none';
+  document.getElementById('openai_voice_row').style.display=(m==='openai')?'block':'none';
+  document.getElementById('elevenlabs_voice_row').style.display=(m==='elevenlabs')?'block':'none';
+}
+updateTtsVoices();
 </script>
 </div></body></html>
 )rawliteral";
@@ -248,17 +400,31 @@ static void handleRoot()
     /* WiFi */
     page.replace("{{SSID}}", htmlEscape(wifi_ssid));
     page.replace("{{PASS}}", htmlEscape(wifi_pass));
-    /* API */
-    page.replace("{{API_URL}}", htmlEscape(api_url));
-    page.replace("{{API_KEY}}", htmlEscape(api_key));
+    /* API keys */
+    page.replace("{{KEY_GROQ}}",   htmlEscape(key_groq));
+    page.replace("{{KEY_GEMINI}}", htmlEscape(key_gemini));
+    page.replace("{{KEY_OPENAI}}", htmlEscape(key_openai));
+    page.replace("{{KEY_11L}}",    htmlEscape(key_elevenlabs));
+    page.replace("{{KEY_CUSTOM}}", htmlEscape(key_custom));
+    page.replace("{{CUSTOM_URL}}", htmlEscape(custom_url));
+    /* LLM provider */
+    page.replace("{{LP_GROQ}}",   llm_provider == "groq"   ? "selected" : "");
+    page.replace("{{LP_GEMINI}}", llm_provider == "gemini" ? "selected" : "");
+    page.replace("{{LP_OPENAI}}", llm_provider == "openai" ? "selected" : "");
+    page.replace("{{LP_CUSTOM}}", llm_provider == "custom" ? "selected" : "");
     page.replace("{{MODEL}}", htmlEscape(model_name));
+    /* STT provider */
+    page.replace("{{SP_GROQ}}",   stt_provider == "groq"   ? "selected" : "");
+    page.replace("{{SP_OPENAI}}", stt_provider == "openai" ? "selected" : "");
     /* System prompt */
     page.replace("{{SYS_PROMPT}}", htmlEscape(system_prompt));
     /* TTS mode selection */
-    page.replace("{{SEL_SAM}}",  tts_mode == "sam"  ? "selected" : "");
-    page.replace("{{SEL_GROQ}}", tts_mode == "groq" ? "selected" : "");
-    page.replace("{{SEL_OFF}}",  tts_mode == "off"  ? "selected" : "");
-    /* TTS voice selection */
+    page.replace("{{SEL_SAM}}",    tts_mode == "sam"    ? "selected" : "");
+    page.replace("{{SEL_GROQ}}",   tts_mode == "groq"   ? "selected" : "");
+    page.replace("{{SEL_OPENAI}}", tts_mode == "openai" ? "selected" : "");
+    page.replace("{{SEL_11L}}",    tts_mode == "elevenlabs" ? "selected" : "");
+    page.replace("{{SEL_OFF}}",    tts_mode == "off"    ? "selected" : "");
+    /* Groq TTS voice selection */
     page.replace("{{V_TARA}}",   tts_voice == "tara"   ? "selected" : "");
     page.replace("{{V_AUTUMN}}", tts_voice == "autumn" ? "selected" : "");
     page.replace("{{V_DIANA}}",  tts_voice == "diana"  ? "selected" : "");
@@ -266,6 +432,34 @@ static void handleRoot()
     page.replace("{{V_TROY}}",   tts_voice == "troy"   ? "selected" : "");
     page.replace("{{V_AUSTIN}}", tts_voice == "austin" ? "selected" : "");
     page.replace("{{V_DANIEL}}", tts_voice == "daniel" ? "selected" : "");
+    /* OpenAI TTS voice selection */
+    page.replace("{{OV_ALLOY}}",   tts_voice == "alloy"   ? "selected" : "");
+    page.replace("{{OV_ASH}}",     tts_voice == "ash"     ? "selected" : "");
+    page.replace("{{OV_CORAL}}",   tts_voice == "coral"   ? "selected" : "");
+    page.replace("{{OV_ECHO}}",    tts_voice == "echo"    ? "selected" : "");
+    page.replace("{{OV_FABLE}}",   tts_voice == "fable"   ? "selected" : "");
+    page.replace("{{OV_NOVA}}",    tts_voice == "nova"    ? "selected" : "");
+    page.replace("{{OV_ONYX}}",    tts_voice == "onyx"    ? "selected" : "");
+    page.replace("{{OV_SAGE}}",    tts_voice == "sage"    ? "selected" : "");
+    page.replace("{{OV_SHIMMER}}", tts_voice == "shimmer" ? "selected" : "");
+    /* ElevenLabs voice selection */
+    page.replace("{{EV_RACHEL}}",  tts_voice == "21m00Tcm4TlvDq8ikWAM" ? "selected" : "");
+    page.replace("{{EV_ADAM}}",    tts_voice == "pNInz6obpgDQGcFmaJgB" ? "selected" : "");
+    page.replace("{{EV_BELLA}}",   tts_voice == "EXAVITQu4vr4xnSDxMaL" ? "selected" : "");
+    page.replace("{{EV_ANTONI}}",  tts_voice == "ErXwobaYiN019PkySvjV" ? "selected" : "");
+    page.replace("{{EV_ARNOLD}}",  tts_voice == "VR6AewLTigWG4xSOukaG" ? "selected" : "");
+    page.replace("{{EV_ELLI}}",    tts_voice == "MF3mGyEYCl7XYWbV9V6O" ? "selected" : "");
+    page.replace("{{EV_JOSH}}",    tts_voice == "TxGEqnHWrfWFTfGW9XjX" ? "selected" : "");
+    page.replace("{{EV_SAM}}",     tts_voice == "yoZ06aMxZJJ28mfd3POQ" ? "selected" : "");
+    /* If using a custom ElevenLabs voice ID, populate the custom input */
+    String ev_custom_id = "";
+    if (tts_mode == "elevenlabs") {
+        const char *builtins[] = {"21m00Tcm4TlvDq8ikWAM","pNInz6obpgDQGcFmaJgB","EXAVITQu4vr4xnSDxMaL","ErXwobaYiN019PkySvjV","VR6AewLTigWG4xSOukaG","MF3mGyEYCl7XYWbV9V6O","TxGEqnHWrfWFTfGW9XjX","yoZ06aMxZJJ28mfd3POQ"};
+        bool is_builtin = false;
+        for (int i = 0; i < 8; i++) if (tts_voice == builtins[i]) { is_builtin = true; break; }
+        if (!is_builtin) ev_custom_id = tts_voice;
+    }
+    page.replace("{{EV_CUSTOM}}", htmlEscape(ev_custom_id));
     web.send(200, "text/html", page);
 }
 
@@ -332,17 +526,90 @@ static void handleScanModels()
                 body = "";   /* free early */
                 if (!err && apiDoc["data"].is<JsonArray>()) {
                     JsonArray data = apiDoc["data"].as<JsonArray>();
+
+                    /* ── Collect candidate models ── */
+                    struct ModelEntry { String id; String owner; long created; };
+                    std::vector<ModelEntry> models;
+                    models.reserve(data.size());
+
+                    bool is_openai = (url.indexOf("openai.com") >= 0);
+
                     for (JsonObject m : data) {
                         const char *id = m["id"] | "";
-                        if (strstr(id, "whisper") || strstr(id, "orpheus") ||
-                            strstr(id, "guard") || strstr(id, "safeguard") ||
-                            strstr(id, "compound")) continue;
+                        if (!id[0]) continue;
+
+                        /* Strip "models/" prefix (Gemini returns this) */
+                        if (strncmp(id, "models/", 7) == 0) id += 7;
+
+                        /* Skip non-language models (audio, image, embedding, moderation, guard, TTS) */
+                        if (strstr(id, "whisper") || strstr(id, "tts") ||
+                            strstr(id, "dall-e")  || strstr(id, "imagen") ||
+                            strstr(id, "embed")   || strstr(id, "moderat") ||
+                            strstr(id, "guard")   || strstr(id, "safeguard") ||
+                            strstr(id, "compound") || strstr(id, "orpheus") ||
+                            strstr(id, "transcri") || strstr(id, "speech") ||
+                            strstr(id, "realtime") || strstr(id, "audio")  ||
+                            strstr(id, "distil-")  || strstr(id, "playai") ||
+                            strstr(id, "davinci")  || strstr(id, "babbage") ||
+                            strstr(id, "curie")    || strstr(id, "ada")    ||
+                            strstr(id, "-live"))
+                            continue;
+
+                        /* OpenAI: whitelist known chat-capable model patterns */
+                        if (is_openai) {
+                            bool chat_ok = strstr(id, "turbo") ||
+                                           strstr(id, "4o")    ||
+                                           strstr(id, "chatgpt") ||
+                                           strncmp(id, "o1", 2) == 0 ||
+                                           strncmp(id, "o3", 2) == 0 ||
+                                           strncmp(id, "o4", 2) == 0 ||
+                                           strstr(id, "gpt-4.1") ||
+                                           strstr(id, "gpt-4.5") ||
+                                           strstr(id, "gpt-5");
+                            if (!chat_ok) continue;
+                        }
+
                         const char *owner = m["owned_by"] | "";
+                        long created = m["created"] | 0L;
+                        models.push_back({String(id), String(owner), created});
+                    }
+
+                    /* ── Sort: preferred models first, then by created desc ── */
+                    /* Priority keywords (lower = better) */
+                    auto priority = [](const String &id) -> int {
+                        /* Top-tier large/versatile models */
+                        if (id.indexOf("70b") >= 0 || id.indexOf("versatile") >= 0 ||
+                            id.indexOf("gpt-4o") >= 0 || id.indexOf("gpt-4.1") >= 0 ||
+                            id.indexOf("pro") >= 0 || id.indexOf("flash") >= 0)
+                            return 0;
+                        /* Mid-tier chat models */
+                        if (id.indexOf("llama") >= 0 || id.indexOf("gemma") >= 0 ||
+                            id.indexOf("qwen") >= 0 || id.indexOf("mistral") >= 0 ||
+                            id.indexOf("gpt-4") >= 0 || id.indexOf("claude") >= 0 ||
+                            id.indexOf("deepseek") >= 0 || id.indexOf("gemini") >= 0)
+                            return 1;
+                        /* Known smaller/mini models */
+                        if (id.indexOf("mini") >= 0 || id.indexOf("8b") >= 0 ||
+                            id.indexOf("3b") >= 0 || id.indexOf("1b") >= 0 ||
+                            id.indexOf("nano") >= 0 || id.indexOf("gpt-3.5") >= 0)
+                            return 3;
+                        /* Everything else */
+                        return 2;
+                    };
+
+                    std::sort(models.begin(), models.end(),
+                        [&priority](const ModelEntry &a, const ModelEntry &b) {
+                            int pa = priority(a.id), pb = priority(b.id);
+                            if (pa != pb) return pa < pb;
+                            return a.created > b.created;  /* newer first */
+                        });
+
+                    for (const auto &e : models) {
                         if (count > 0) json += ",";
                         json += "{\"id\":\"";
-                        json += id;
+                        json += e.id;
                         json += "\",\"owned_by\":\"";
-                        json += owner;
+                        json += e.owner;
                         json += "\"}";
                         count++;
                     }
@@ -380,22 +647,30 @@ static void handleSaveWifi()
 
 static void handleSaveApi()
 {
-    api_url    = web.arg("api_url");
-    api_key    = web.arg("api_key");
-    model_name = web.arg("model");
-    tts_mode   = web.arg("tts_mode");
-    tts_voice  = web.arg("tts_voice");
-    if (api_url.length() == 0)   api_url   = "https://api.groq.com/openai/v1";
-    if (model_name.length() == 0) model_name = "llama-3.3-70b-versatile";
-    if (tts_mode.length() == 0)  tts_mode  = "sam";
-    if (tts_voice.length() == 0) tts_voice = "tara";
+    llm_provider = web.arg("llm_provider");
+    model_name   = web.arg("model");
+    stt_provider = web.arg("stt_provider");
+    tts_mode     = web.arg("tts_mode");
+    tts_voice    = web.arg("tts_voice");
+    if (llm_provider.length() == 0) llm_provider = "groq";
+    if (model_name.length() == 0)   model_name   = "llama-3.3-70b-versatile";
+    if (stt_provider.length() == 0) stt_provider = "groq";
+    if (tts_mode.length() == 0)     tts_mode     = "sam";
+    if (tts_voice.length() == 0)    tts_voice    = "tara";
 
-    Serial.println("[PORTAL] Saving API settings:");
-    Serial.printf("[PORTAL]   URL:   %s\n", api_url.c_str());
+    /* Derive api_url and api_key from the provider selections */
+    api_url = url_for_provider(llm_provider);
+    api_key = key_for_provider(llm_provider);
+
+    Serial.println("[PORTAL] Saving provider settings:");
+    Serial.printf("[PORTAL]   LLM:   %s → %s\n", llm_provider.c_str(), api_url.c_str());
     Serial.printf("[PORTAL]   Model: %s\n", model_name.c_str());
+    Serial.printf("[PORTAL]   STT:   %s\n", stt_provider.c_str());
     Serial.printf("[PORTAL]   TTS:   %s / %s\n", tts_mode.c_str(), tts_voice.c_str());
 
     prefs.begin("m8b", false);
+    prefs.putString("llm_prov",  llm_provider);
+    prefs.putString("stt_prov",  stt_provider);
     prefs.putString("api_url",   api_url);
     prefs.putString("api_key",   api_key);
     prefs.putString("model",     model_name);
@@ -408,7 +683,39 @@ static void handleSaveApi()
         llm_init(api_url, api_key, model_name);
     }
 
-    web.send(200, "text/plain", "API settings saved!");
+    web.send(200, "text/plain", "Provider settings saved!");
+}
+
+static void handleSaveKeys()
+{
+    key_groq   = web.arg("key_groq");
+    key_gemini = web.arg("key_gemini");
+    key_openai = web.arg("key_openai");
+    key_elevenlabs = web.arg("key_elevenlabs");
+    key_custom = web.arg("key_custom");
+    custom_url = web.arg("custom_url");
+
+    Serial.println("[PORTAL] Saving API keys:");
+    Serial.printf("[PORTAL]   Groq:   %d chars\n", key_groq.length());
+    Serial.printf("[PORTAL]   Gemini: %d chars\n", key_gemini.length());
+    Serial.printf("[PORTAL]   OpenAI: %d chars\n", key_openai.length());
+    Serial.printf("[PORTAL]   11Labs: %d chars\n", key_elevenlabs.length());
+    Serial.printf("[PORTAL]   Custom: %d chars (URL: %s)\n", key_custom.length(), custom_url.c_str());
+
+    prefs.begin("m8b", false);
+    prefs.putString("key_groq",   key_groq);
+    prefs.putString("key_gemini", key_gemini);
+    prefs.putString("key_openai", key_openai);
+    prefs.putString("key_11l",    key_elevenlabs);
+    prefs.putString("key_custom", key_custom);
+    prefs.putString("custom_url", custom_url);
+    prefs.end();
+
+    /* Update derived api_url/api_key in case the active provider's key changed */
+    api_url = url_for_provider(llm_provider);
+    api_key = key_for_provider(llm_provider);
+
+    web.send(200, "text/plain", "API keys saved!");
 }
 
 static void handleSavePrompt()
@@ -452,8 +759,21 @@ void config_portal_begin(void)
     prefs.begin("m8b", true);
     wifi_ssid     = prefs.getString("ssid",    "");
     wifi_pass     = prefs.getString("pass",    "");
-    api_url       = prefs.getString("api_url", "https://api.groq.com/openai/v1");
-    api_key       = prefs.getString("api_key", "");
+    /* per-service API keys */
+    key_groq      = prefs.getString("key_groq",   prefs.getString("api_key", ""));
+    key_gemini    = prefs.getString("key_gemini",  "");
+    key_openai    = prefs.getString("key_openai",  "");
+    key_elevenlabs = prefs.getString("key_11l",     "");
+    key_custom    = prefs.getString("key_custom",  "");
+    custom_url    = prefs.getString("custom_url",  "");
+    /* provider selections */
+    llm_provider  = prefs.getString("llm_prov",  "groq");
+    stt_provider  = prefs.getString("stt_prov",  "groq");
+    /* derived URL/key (or legacy fallback) */
+    api_url       = url_for_provider(llm_provider);
+    api_key       = key_for_provider(llm_provider);
+    if (api_url.length() == 0) api_url = prefs.getString("api_url", "https://api.groq.com/openai/v1");
+    if (api_key.length() == 0) api_key = prefs.getString("api_key", "");
     model_name    = prefs.getString("model",   "llama-3.3-70b-versatile");
     system_prompt = prefs.getString("sys_prmpt", DEFAULT_SYS_PROMPT);
     tts_mode      = prefs.getString("tts_mode",  "sam");
@@ -462,9 +782,13 @@ void config_portal_begin(void)
 
     Serial.println("[PORTAL] Loaded NVS settings:");
     Serial.printf("[PORTAL]   SSID:  '%s'\n", wifi_ssid.c_str());
-    Serial.printf("[PORTAL]   URL:   %s\n", api_url.c_str());
+    Serial.printf("[PORTAL]   LLM:   %s → %s\n", llm_provider.c_str(), api_url.c_str());
+    Serial.printf("[PORTAL]   STT:   %s\n", stt_provider.c_str());
     Serial.printf("[PORTAL]   Model: %s\n", model_name.c_str());
-    Serial.printf("[PORTAL]   Key:   %d chars\n", api_key.length());
+    Serial.printf("[PORTAL]   Keys:  groq=%d gemini=%d openai=%d 11l=%d custom=%d\n",
+                  key_groq.length(), key_gemini.length(),
+                  key_openai.length(), key_elevenlabs.length(),
+                  key_custom.length());
 
     if (wifi_ssid.length() > 0) {
         WiFi.mode(WIFI_STA);
@@ -497,6 +821,7 @@ void config_portal_begin(void)
     web.on("/scan_wifi",   HTTP_GET,  handleScanWifi);
     web.on("/scan_models", HTTP_GET,  handleScanModels);
     web.on("/save_wifi",   HTTP_POST, handleSaveWifi);
+    web.on("/save_keys",   HTTP_POST, handleSaveKeys);
     web.on("/save_api",    HTTP_POST, handleSaveApi);
     web.on("/save_prompt", HTTP_POST, handleSavePrompt);
     web.onNotFound(handleNotFound);
@@ -518,3 +843,15 @@ String config_portal_get_model(void)     { return model_name;  }
 String config_portal_get_system_prompt(void) { return system_prompt; }
 String config_portal_get_tts_mode(void)      { return tts_mode; }
 String config_portal_get_tts_voice(void)     { return tts_voice; }
+String config_portal_get_stt_provider(void)  { return stt_provider; }
+String config_portal_get_stt_url(void)       { return url_for_provider(stt_provider); }
+String config_portal_get_stt_key(void)       { return key_for_provider(stt_provider); }
+String config_portal_get_tts_key(void) {
+    if (tts_mode == "openai") return key_openai;
+    if (tts_mode == "elevenlabs") return key_elevenlabs;
+    return key_groq;  /* groq or sam (sam doesn't use it) */
+}
+String config_portal_get_tts_url(void) {
+    if (tts_mode == "openai") return url_for_provider("openai");
+    return url_for_provider("groq");
+}

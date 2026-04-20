@@ -12,3 +12,8 @@ String config_portal_get_model(void);
 String config_portal_get_system_prompt(void);
 String config_portal_get_tts_mode(void);
 String config_portal_get_tts_voice(void);
+String config_portal_get_stt_provider(void);
+String config_portal_get_stt_url(void);
+String config_portal_get_stt_key(void);
+String config_portal_get_tts_key(void);
+String config_portal_get_tts_url(void);

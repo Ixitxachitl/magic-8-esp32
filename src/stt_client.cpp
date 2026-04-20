@@ -14,6 +14,7 @@
 /* ── config ────────────────────────────────────────────────────── */
 static String cfg_url;
 static String cfg_key;
+static String cfg_model;
 
 /* ── inter-task comms ──────────────────────────────────────────── */
 static volatile bool     stt_pending = false;
@@ -78,7 +79,12 @@ static size_t build_body(uint8_t *dst, const int16_t *samples, size_t count)
     /* Part 2 – model */
     APPEND_STR("--"); APPEND_STR(BOUNDARY); APPEND_STR("\r\n");
     APPEND_STR("Content-Disposition: form-data; name=\"model\"\r\n\r\n");
-    APPEND_STR("whisper-large-v3-turbo\r\n");
+    {
+        const char *m = cfg_model.c_str();
+        size_t ml = strlen(m);
+        memcpy(dst + pos, m, ml); pos += ml;
+    }
+    APPEND_STR("\r\n");
 
     /* Part 3 – response_format */
     APPEND_STR("--"); APPEND_STR(BOUNDARY); APPEND_STR("\r\n");
@@ -185,9 +191,15 @@ void stt_init(const String &api_url, const String &api_key)
 {
     cfg_url = api_url;
     cfg_key = api_key;
+    /* Pick the right Whisper model based on provider URL */
+    if (api_url.indexOf("openai.com") >= 0) {
+        cfg_model = "whisper-1";
+    } else {
+        cfg_model = "whisper-large-v3-turbo";
+    }
     if (!stt_mutex) stt_mutex = xSemaphoreCreateMutex();
     Serial.println("[STT] Initialized");
-    Serial.printf("[STT]   URL: %s\n", api_url.c_str());
+    Serial.printf("[STT]   URL: %s  model: %s\n", api_url.c_str(), cfg_model.c_str());
 }
 
 void stt_start_transcribe(const int16_t *samples, size_t sample_count)

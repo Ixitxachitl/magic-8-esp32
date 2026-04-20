@@ -35,89 +35,127 @@ static void llm_task(void *param)
 {
     (void)param;
     String result;
+    const int MAX_RETRIES = 2;
 
     Serial.println("[LLM] Task started");
 
-    WiFiClientSecure *client = new WiFiClientSecure();
-    if (client) {
+    for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+            Serial.printf("[LLM] Retry %d/%d\n", attempt, MAX_RETRIES);
+            delay(500);
+        }
+        result = "";
+
+        WiFiClientSecure *client = new WiFiClientSecure();
+        if (!client) {
+            result = "Out of memory";
+            Serial.println("[LLM] Failed to allocate WiFiClientSecure");
+            break;
+        }
         client->setInsecure();
-        Serial.println("[LLM] TLS client created (insecure mode)");
 
         HTTPClient http;
         String url = cfg_url;
         if (!url.endsWith("/")) url += "/";
         url += "chat/completions";
-        Serial.printf("[LLM] POST %s\n", url.c_str());
-        Serial.printf("[LLM] Model: %s\n", cfg_model.c_str());
+        if (attempt == 0) {
+            Serial.printf("[LLM] POST %s\n", url.c_str());
+            Serial.printf("[LLM] Model: %s\n", cfg_model.c_str());
+        }
 
-        if (http.begin(*client, url)) {
-            http.addHeader("Content-Type", "application/json");
-            if (cfg_key.length() > 0) {
-                http.addHeader("Authorization", "Bearer " + cfg_key);
-                Serial.printf("[LLM] Auth header set (key len=%d)\n", cfg_key.length());
-            } else {
-                Serial.println("[LLM] WARNING: No API key set");
-            }
-            http.setTimeout(15000);
-
-            /* build JSON payload */
-            JsonDocument doc;
-            doc["model"]      = cfg_model;
-            doc["max_tokens"] = 150;
-            doc["temperature"] = 1.2;
-
-            JsonArray msgs = doc["messages"].to<JsonArray>();
-            JsonObject sm  = msgs.add<JsonObject>();
-            sm["role"]    = "system";
-            sm["content"] = custom_sys_prompt.length() > 0
-                            ? custom_sys_prompt.c_str()
-                            : DEFAULT_SYS_PROMPT;
-            JsonObject um  = msgs.add<JsonObject>();
-            um["role"]    = "user";
-            um["content"] = pending_question.length() > 0
-                            ? pending_question.c_str()
-                            : "Give me a Magic 8 Ball answer.";
-
-            String payload;
-            serializeJson(doc, payload);
-            Serial.printf("[LLM] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
-
-            unsigned long t0 = millis();
-            int code = http.POST(payload);
-            unsigned long elapsed = millis() - t0;
-            Serial.printf("[LLM] HTTP response: %d (%lu ms)\n", code, elapsed);
-
-            if (code == 200) {
-                String body = http.getString();
-                Serial.printf("[LLM] Body (%d bytes): %s\n", body.length(), body.c_str());
-                JsonDocument resp;
-                DeserializationError err = deserializeJson(resp, body);
-                if (!err) {
-                    result = resp["choices"][0]["message"]["content"].as<String>();
-                    result.trim();
-                    result.replace("\"", "");
-                    result.replace("*", "");
-                    if (result.length() > 200)
-                        result = result.substring(0, 197) + "...";
-                    Serial.printf("[LLM] Answer: \"%s\"\n", result.c_str());
-                } else {
-                    result = "The spirits\nare confused";
-                    Serial.printf("[LLM] JSON parse error: %s\n", err.c_str());
-                }
-            } else {
-                String errBody = http.getString();
-                Serial.printf("[LLM] HTTP error %d: %s\n", code, errBody.c_str());
-                result = "Cannot reach\nthe beyond";
-            }
-            http.end();
-        } else {
+        if (!http.begin(*client, url)) {
             result = "Connection\nfailed";
             Serial.println("[LLM] http.begin() failed");
+            delete client;
+            continue;  /* retry */
         }
+
+        http.addHeader("Content-Type", "application/json");
+        if (cfg_key.length() > 0) {
+            http.addHeader("Authorization", "Bearer " + cfg_key);
+            if (attempt == 0)
+                Serial.printf("[LLM] Auth header set (key len=%d)\n", cfg_key.length());
+        } else {
+            Serial.println("[LLM] WARNING: No API key set");
+        }
+        http.setTimeout(15000);
+
+        /* build JSON payload */
+        JsonDocument doc;
+        doc["model"]      = cfg_model;
+        doc["max_completion_tokens"] = 1024;
+        doc["temperature"] = 1.2;
+
+        JsonArray msgs = doc["messages"].to<JsonArray>();
+        JsonObject sm  = msgs.add<JsonObject>();
+        sm["role"]    = "system";
+        sm["content"] = custom_sys_prompt.length() > 0
+                        ? custom_sys_prompt.c_str()
+                        : DEFAULT_SYS_PROMPT;
+        JsonObject um  = msgs.add<JsonObject>();
+        um["role"]    = "user";
+        um["content"] = pending_question.length() > 0
+                        ? pending_question.c_str()
+                        : "Give me a Magic 8 Ball answer.";
+
+        String payload;
+        serializeJson(doc, payload);
+        if (attempt == 0)
+            Serial.printf("[LLM] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
+
+        unsigned long t0 = millis();
+        int code = http.POST(payload);
+        unsigned long elapsed = millis() - t0;
+        Serial.printf("[LLM] HTTP response: %d (%lu ms)\n", code, elapsed);
+
+        if (code == 200) {
+            String body = http.getString();
+            Serial.printf("[LLM] Body (%d bytes): %s\n", body.length(), body.c_str());
+            JsonDocument resp;
+            DeserializationError err = deserializeJson(resp, body);
+            if (!err) {
+                result = resp["choices"][0]["message"]["content"].as<String>();
+                result.trim();
+                result.replace("\"", "");
+                result.replace("*", "");
+                /* Replace Unicode chars not in LVGL Montserrat (Basic Latin only) */
+                result.replace("\xe2\x80\x94", "-");   /* em dash — */
+                result.replace("\xe2\x80\x93", "-");   /* en dash – */
+                result.replace("\xe2\x80\x98", "'");   /* left single quote ' */
+                result.replace("\xe2\x80\x99", "'");   /* right single quote ' */
+                result.replace("\xe2\x80\x9c", "\"");  /* left double quote " */
+                result.replace("\xe2\x80\x9d", "\"");  /* right double quote " */
+                result.replace("\xe2\x80\xa6", "...");  /* ellipsis … */
+                if (result.length() > 200)
+                    result = result.substring(0, 197) + "...";
+                Serial.printf("[LLM] Answer: \"%s\"\n", result.c_str());
+            } else {
+                result = "The spirits\nare confused";
+                Serial.printf("[LLM] JSON parse error: %s\n", err.c_str());
+            }
+            http.end();
+            delete client;
+            break;  /* success — stop retrying */
+        }
+
+        String errBody = http.getString();
+        Serial.printf("[LLM] HTTP error %d: %s\n", code, errBody.c_str());
+        http.end();
         delete client;
-    } else {
-        result = "Out of memory";
-        Serial.println("[LLM] Failed to allocate WiFiClientSecure");
+
+        /* Only retry on timeouts, server errors, and rate limits */
+        if (code == 429) {
+            Serial.println("[LLM] Rate limited – will retry");
+            result = "Cannot reach\nthe beyond";
+            delay(3000);  /* brief backoff before retry */
+            /* loop continues to retry */
+        } else if (code >= 400 && code < 500) {
+            result = "Cannot reach\nthe beyond";
+            break;  /* don't retry other client errors */
+        } else {
+            result = "Cannot reach\nthe beyond";
+            /* loop continues to retry */
+        }
     }
 
     xSemaphoreTake(res_mutex, portMAX_DELAY);
