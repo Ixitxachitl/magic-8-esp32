@@ -70,17 +70,22 @@ void tts_elevenlabs_say(const char *text)
 
     Serial.printf("[TTS-11L] POST %s\n", url.c_str());
 
-    /* HTTPS request */
-    WiFiClientSecure *client = new WiFiClientSecure();
-    if (!client) {
-        Serial.println("[TTS-11L] WiFiClientSecure alloc failed");
-        return;
-    }
-    client->setInsecure();
-
+    /* HTTPS request – retry once on connection failure */
+    WiFiClientSecure *client = NULL;
     size_t total_read = 0;
     uint8_t *pcm_buf  = NULL;
     int content_len    = 0;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        client = new WiFiClientSecure();
+        if (!client) {
+            Serial.println("[TTS-11L] WiFiClientSecure alloc failed");
+            return;
+        }
+        client->setInsecure();
+
+        total_read  = 0;
+        content_len = 0;
 
     {
         HTTPClient http;
@@ -88,6 +93,8 @@ void tts_elevenlabs_say(const char *text)
         if (!http.begin(*client, url)) {
             Serial.println("[TTS-11L] http.begin() failed");
             delete client;
+            client = NULL;
+            if (attempt == 0) { delay(500); continue; }
             return;
         }
 
@@ -105,6 +112,12 @@ void tts_elevenlabs_say(const char *text)
             Serial.printf("[TTS-11L] Error: %s\n", errBody.c_str());
             http.end();
             delete client;
+            client = NULL;
+            if (code < 0 && attempt == 0) {
+                Serial.println("[TTS-11L] Retrying...");
+                delay(500);
+                continue;
+            }
             return;
         }
 
@@ -148,6 +161,8 @@ void tts_elevenlabs_say(const char *text)
         http.end();
     }
     delete client;
+    break;  /* success – exit retry loop */
+    } /* end retry loop */
 
     Serial.printf("[TTS-11L] Downloaded %u bytes raw PCM\n", (unsigned)total_read);
 
