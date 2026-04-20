@@ -171,8 +171,6 @@ enum AppState {
 };
 static AppState       app_state          = STATE_IDLE;
 static unsigned long  last_partial_ms    = 0;
-static size_t         partial_sample_count = 0;  /* samples when partial was sent */
-static bool           final_stt_sent     = false;
 static unsigned long  transcript_shown_ms = 0;
 static String         final_transcript;
 static String         pending_answer;
@@ -513,68 +511,21 @@ void loop()
         magic8ball_ui_set_audio_level(mic_recorder_get_audio_level());
         lvgl_unlock();
 
-        /* pick up any partial STT result */
-        String partial;
-        if (stt_check_result(partial) && partial.length() > 0) {
-            Serial.printf("[LOOP] Partial transcript: \"%s\"\n", partial.c_str());
-            final_transcript = partial;   /* keep latest for fast path */
-            lvgl_lock();
-            magic8ball_ui_set_transcript(partial.c_str());
-            lvgl_unlock();
-        }
-
-        /* fire partial STT every 2 s while enough audio exists */
-        if (millis() - last_partial_ms > 2000 &&
-            !stt_is_busy() &&
-            mic_recorder_get_sample_count() > 8000) {        /* >0.5 s */
-            Serial.println("[LOOP] Sending partial audio to STT...");
-            partial_sample_count = mic_recorder_get_sample_count();
-            stt_start_transcribe(mic_recorder_get_audio_buffer(),
-                                 partial_sample_count);
-            last_partial_ms = millis();
-        }
-
-        /* speech ended → always do final STT with complete audio */
+        /* speech ended or silence timeout → send full audio to STT */
         bool timed_out = millis() - last_partial_ms > 8000;
         if (mic_recorder_speech_ended() || timed_out) {
             mic_recorder_stop();
             tone_player_beep_done();
 
             size_t samples = mic_recorder_get_sample_count();
-
-            /* Use partial transcript only if it covered most of the audio.
-               If the user kept talking after the partial was sent, the
-               partial is incomplete – need full transcription instead. */
-            bool partial_is_complete = (final_transcript.length() > 0) &&
-                                       (samples <= partial_sample_count * 3 / 2);
-            if (partial_is_complete) {
-                /* Cancel in-flight partial (result will be discarded) */
-                String discard;
-                stt_check_result(discard);
-                Serial.printf("[LOOP] Using partial transcript: \"%s\"\n",
-                              final_transcript.c_str());
-                /* Settle spin to show transcript */
-                settle_complete = false;
-                lvgl_lock();
-                magic8ball_ui_settle_then(on_settle_done);
-                lvgl_unlock();
-                app_state = STATE_SETTLING_TRANSCRIPT;
-                Serial.println("[LOOP] → SETTLING_TRANSCRIPT (fast path)");
-                break;
-            }
-
-            /* No partial available – need full transcription */
-            /* Drain any in-flight partial result – discard it */
-            String discard;
-            stt_check_result(discard);
             final_transcript = "";
 
             if (samples > 1600) {   /* at least 0.1 s of audio */
                 Serial.printf("[LOOP] %s → TRANSCRIBING (%u samples)\n",
                               timed_out ? "Timeout with audio" : "Speech ended",
                               (unsigned)samples);
-                app_state       = STATE_TRANSCRIBING;
-                final_stt_sent  = false;
+                stt_start_transcribe(mic_recorder_get_audio_buffer(), samples);
+                app_state = STATE_TRANSCRIBING;
                 transcript_shown_ms = millis();
             } else {
                 Serial.println("[LOOP] No usable audio – back to idle");
@@ -589,37 +540,8 @@ void loop()
     }
 
     case STATE_TRANSCRIBING: {
-        /* Wait for any in-flight partial to finish, then send full audio */
-        if (!final_stt_sent) {
-            String partial;
-            if (stt_check_result(partial)) {
-                /* Partial finished — use it only if it covered most of the audio */
-                size_t total = mic_recorder_get_sample_count();
-                bool covers_enough = (partial.length() > 0) &&
-                                     (total <= partial_sample_count * 3 / 2);
-                if (covers_enough) {
-                    Serial.printf("[LOOP] Using partial result: \"%s\"\n", partial.c_str());
-                    final_transcript = partial;
-                    settle_complete = false;
-                    lvgl_lock();
-                    magic8ball_ui_settle_then(on_settle_done);
-                    lvgl_unlock();
-                    app_state = STATE_SETTLING_TRANSCRIPT;
-                    Serial.println("[LOOP] → SETTLING_TRANSCRIPT (from partial)");
-                    break;
-                } else if (partial.length() > 0) {
-                    Serial.printf("[LOOP] Partial too short (%u vs %u samples), sending full\n",
-                                  (unsigned)partial_sample_count, (unsigned)total);
-                }
-            }
-            if (!stt_is_busy()) {
-                stt_start_transcribe(mic_recorder_get_audio_buffer(),
-                                     mic_recorder_get_sample_count());
-                final_stt_sent = true;
-                transcript_shown_ms = millis();  /* reset timeout for final request */
-                Serial.println("[LOOP] Final STT request sent (full audio)");
-            }
-        } else {
+        /* Wait for full STT result */
+        {
             String text;
             if (stt_check_result(text)) {
                 if (text.length() > 0) {
