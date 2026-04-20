@@ -171,6 +171,7 @@ enum AppState {
 };
 static AppState       app_state          = STATE_IDLE;
 static unsigned long  last_partial_ms    = 0;
+static size_t         partial_sample_count = 0;  /* samples when partial was sent */
 static bool           final_stt_sent     = false;
 static unsigned long  transcript_shown_ms = 0;
 static String         final_transcript;
@@ -523,8 +524,9 @@ void loop()
             !stt_is_busy() &&
             mic_recorder_get_sample_count() > 8000) {        /* >0.5 s */
             Serial.println("[LOOP] Sending partial audio to STT...");
+            partial_sample_count = mic_recorder_get_sample_count();
             stt_start_transcribe(mic_recorder_get_audio_buffer(),
-                                 mic_recorder_get_sample_count());
+                                 partial_sample_count);
             last_partial_ms = millis();
         }
 
@@ -536,9 +538,12 @@ void loop()
 
             size_t samples = mic_recorder_get_sample_count();
 
-            /* If we already have a partial transcript, use it directly
-               instead of waiting for the slow final round-trip */
-            if (final_transcript.length() > 0) {
+            /* Use partial transcript only if it covered most of the audio.
+               If the user kept talking after the partial was sent, the
+               partial is incomplete – need full transcription instead. */
+            bool partial_is_complete = (final_transcript.length() > 0) &&
+                                       (samples <= partial_sample_count * 3 / 2);
+            if (partial_is_complete) {
                 /* Cancel in-flight partial (result will be discarded) */
                 String discard;
                 stt_check_result(discard);
@@ -584,9 +589,11 @@ void loop()
         if (!final_stt_sent) {
             String partial;
             if (stt_check_result(partial)) {
-                /* Partial finished — if it has content, use it directly
-                   instead of sending the full (much larger) audio again */
-                if (partial.length() > 0) {
+                /* Partial finished — use it only if it covered most of the audio */
+                size_t total = mic_recorder_get_sample_count();
+                bool covers_enough = (partial.length() > 0) &&
+                                     (total <= partial_sample_count * 3 / 2);
+                if (covers_enough) {
                     Serial.printf("[LOOP] Using partial result: \"%s\"\n", partial.c_str());
                     final_transcript = partial;
                     settle_complete = false;
@@ -596,6 +603,9 @@ void loop()
                     app_state = STATE_SETTLING_TRANSCRIPT;
                     Serial.println("[LOOP] → SETTLING_TRANSCRIPT (from partial)");
                     break;
+                } else if (partial.length() > 0) {
+                    Serial.printf("[LOOP] Partial too short (%u vs %u samples), sending full\n",
+                                  (unsigned)partial_sample_count, (unsigned)total);
                 }
             }
             if (!stt_is_busy()) {
