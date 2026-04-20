@@ -226,7 +226,7 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 </div>
 <div id="elevenlabs_voice_row" style="display:none">
 <label>ElevenLabs Voice</label>
-<select id="tts_voice_11l">
+<select id="tts_voice_11l" onchange="update11lCustom()">
   <option value="21m00Tcm4TlvDq8ikWAM" {{EV_RACHEL}}>Rachel (Female, warm)</option>
   <option value="pNInz6obpgDQGcFmaJgB" {{EV_ADAM}}>Adam (Male, deep)</option>
   <option value="EXAVITQu4vr4xnSDxMaL" {{EV_BELLA}}>Bella (Female, young)</option>
@@ -235,10 +235,12 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
   <option value="MF3mGyEYCl7XYWbV9V6O" {{EV_ELLI}}>Elli (Female, child-like)</option>
   <option value="TxGEqnHWrfWFTfGW9XjX" {{EV_JOSH}}>Josh (Male, warm)</option>
   <option value="yoZ06aMxZJJ28mfd3POQ" {{EV_SAM}}>Sam (Male, raspy)</option>
+  <option value="__custom__" {{EV_CUSTOM_SEL}}>Custom Voice ID...</option>
 </select>
-<label>Or paste a custom Voice ID:</label>
+<div id="11l_custom_row" style="display:none">
 <input id="tts_voice_11l_custom" value="{{EV_CUSTOM}}" placeholder="e.g. abc123def456">
 <p class="note">Browse voices at elevenlabs.io/voice-library</p>
+</div>
 </div>
 
 <button class="btn btn-blue" type="button" onclick="saveProviders()">Save Provider Settings</button>
@@ -287,8 +289,12 @@ function saveProviders(){
   if(ttsMode==='groq') voice=document.getElementById('tts_voice').value;
   else if(ttsMode==='openai') voice=document.getElementById('tts_voice_openai').value;
   else if(ttsMode==='elevenlabs'){
-    var cv=document.getElementById('tts_voice_11l_custom').value.trim();
-    voice=cv.length>0?cv:document.getElementById('tts_voice_11l').value;
+    var sel=document.getElementById('tts_voice_11l').value;
+    if(sel==='__custom__'){
+      voice=document.getElementById('tts_voice_11l_custom').value.trim();
+    } else {
+      voice=sel;
+    }
   }
   var d='llm_provider='+encodeURIComponent(document.getElementById('llm_provider').value)
        +'&model='+encodeURIComponent(document.getElementById('model_sel').value)
@@ -375,6 +381,11 @@ function updateTtsVoices(){
   document.getElementById('groq_voice_row').style.display=(m==='groq')?'block':'none';
   document.getElementById('openai_voice_row').style.display=(m==='openai')?'block':'none';
   document.getElementById('elevenlabs_voice_row').style.display=(m==='elevenlabs')?'block':'none';
+  if(m==='elevenlabs') update11lCustom();
+}
+function update11lCustom(){
+  var sel=document.getElementById('tts_voice_11l').value;
+  document.getElementById('11l_custom_row').style.display=(sel==='__custom__')?'block':'none';
 }
 updateTtsVoices();
 </script>
@@ -459,6 +470,7 @@ static void handleRoot()
         for (int i = 0; i < 8; i++) if (tts_voice == builtins[i]) { is_builtin = true; break; }
         if (!is_builtin) ev_custom_id = tts_voice;
     }
+    page.replace("{{EV_CUSTOM_SEL}}", ev_custom_id.length() > 0 ? "selected" : "");
     page.replace("{{EV_CUSTOM}}", htmlEscape(ev_custom_id));
     web.send(200, "text/html", page);
 }
