@@ -184,13 +184,9 @@ static void tts_bg_task(void *param)
 {
     (void)param;
     if (tts_task_buf) {
-        /* Re-read voice from config each time so portal changes apply live */
-        String voice = config_portal_get_tts_voice();
         if (tts_mode_str == "groq" || tts_mode_str == "openai") {
-            tts_groq_set_voice(voice);
             tts_groq_say(tts_task_buf);
         } else if (tts_mode_str == "elevenlabs") {
-            tts_elevenlabs_set_voice(voice);
             tts_elevenlabs_say(tts_task_buf);
         } else if (tts_mode_str == "sam") {
             tts_say(tts_task_buf);
@@ -200,6 +196,79 @@ static void tts_bg_task(void *param)
     }
     tts_playing = false;
     vTaskDelete(NULL);
+}
+
+/* ── Apply all provider/key settings live ──────────────────────── */
+static void apply_provider_settings()
+{
+    /* LLM */
+    String key = config_portal_get_api_key();
+    if (key.length() > 0) {
+        llm_init(config_portal_get_api_url(), key, config_portal_get_model());
+        llm_set_system_prompt(config_portal_get_system_prompt());
+        use_llm = true;
+        Serial.println("[SETTINGS] LLM re-init OK");
+    } else {
+        use_llm = false;
+        Serial.println("[SETTINGS] LLM disabled (no key)");
+    }
+
+    /* STT */
+    if (mic_ok) {
+        String stt_url = config_portal_get_stt_url();
+        String stt_key = config_portal_get_stt_key();
+        if (stt_key.length() > 0 && stt_url.length() > 0) {
+            stt_init(stt_url, stt_key);
+            Serial.printf("[SETTINGS] STT: %s\n", config_portal_get_stt_provider().c_str());
+        } else {
+            Serial.println("[SETTINGS] STT disabled (no key)");
+        }
+    }
+
+    /* TTS */
+    if (mic_ok) {
+        tts_mode_str = config_portal_get_tts_mode();
+        if (tts_mode_str == "groq" || tts_mode_str == "openai") {
+            String tts_key = config_portal_get_tts_key();
+            if (tts_key.length() > 0) {
+                tts_groq_init(config_portal_get_tts_url(), tts_key);
+                tts_groq_set_voice(config_portal_get_tts_voice());
+                if (tts_mode_str == "openai") {
+                    tts_groq_set_model("tts-1");
+                    Serial.println("[SETTINGS] TTS: OpenAI");
+                } else {
+                    tts_groq_set_model("canopylabs/orpheus-v1-english");
+                    Serial.println("[SETTINGS] TTS: Groq Orpheus");
+                }
+            } else {
+                tts_mode_str = "sam";
+                tts_init();
+                Serial.println("[SETTINGS] TTS: key missing, fallback SAM");
+            }
+        } else if (tts_mode_str == "elevenlabs") {
+            String tts_key = config_portal_get_tts_key();
+            if (tts_key.length() > 0) {
+                tts_elevenlabs_init(tts_key);
+                tts_elevenlabs_set_voice(config_portal_get_tts_voice());
+                Serial.println("[SETTINGS] TTS: ElevenLabs");
+            } else {
+                tts_mode_str = "sam";
+                tts_init();
+                Serial.println("[SETTINGS] TTS: ElevenLabs key missing, fallback SAM");
+            }
+        } else if (tts_mode_str == "sam") {
+            tts_init();
+            Serial.println("[SETTINGS] TTS: SAM");
+        } else {
+            Serial.println("[SETTINGS] TTS: Off");
+        }
+    }
+}
+
+static void on_settings_changed()
+{
+    Serial.println("[SETTINGS] Portal settings changed – applying live...");
+    apply_provider_settings();
 }
 
 static void on_settle_done(void) { settle_complete = true; }
@@ -408,33 +477,9 @@ void setup()
     Serial.println("[INIT] LVGL rendering task started on core 0");
 
     /* ── WiFi + config portal ────────────────────────────────── */    Serial.println("[INIT] Starting WiFi / config portal...");    config_portal_begin();
+    config_portal_set_settings_changed_cb(on_settings_changed);
 
     if (config_portal_is_configured()) {
-        String key = config_portal_get_api_key();
-        if (key.length() > 0) {
-            llm_init(config_portal_get_api_url(),
-                     key,
-                     config_portal_get_model());
-            llm_set_system_prompt(config_portal_get_system_prompt());
-            use_llm = true;
-            Serial.println("[INIT] LLM mode ENABLED (online)");
-        } else {
-            Serial.println("[INIT] No API key – classic offline mode");
-        }
-
-        /* ── STT init (may use a different provider than LLM) ──── */
-        String stt_prov = config_portal_get_stt_provider();
-        {
-            String stt_url = config_portal_get_stt_url();
-            String stt_key = config_portal_get_stt_key();
-            if (stt_key.length() > 0 && stt_url.length() > 0) {
-                stt_init(stt_url, stt_key);
-                Serial.printf("[INIT] STT: %s\n", stt_prov.c_str());
-            } else {
-                Serial.printf("[INIT] STT provider '%s' has no key – disabled\n", stt_prov.c_str());
-            }
-        }
-
         /* ── Microphone (ES8311) ─────────────────────────────── */
         mic_ok = mic_recorder_init();
         Serial.printf("[INIT] Microphone %s\n", mic_ok ? "OK" : "FAIL (voice disabled)");
@@ -443,46 +488,10 @@ void setup()
         if (mic_ok) {
             tone_player_init();
             Serial.println("[INIT] Tone player OK");
-
-            /* ── TTS engine selection ────────────────────────── */
-            tts_mode_str = config_portal_get_tts_mode();
-            if (tts_mode_str == "groq" || tts_mode_str == "openai") {
-                String tts_key = config_portal_get_tts_key();
-                if (tts_key.length() > 0) {
-                    tts_groq_init(config_portal_get_tts_url(), tts_key);
-                    tts_groq_set_voice(config_portal_get_tts_voice());
-                    if (tts_mode_str == "openai") {
-                        tts_groq_set_model("tts-1");
-                        Serial.println("[INIT] TTS: OpenAI");
-                    } else {
-                        tts_groq_set_model("canopylabs/orpheus-v1-english");
-                        Serial.println("[INIT] TTS: Groq Orpheus");
-                    }
-                } else {
-                    tts_mode_str = "sam";
-                    tts_init();
-                    Serial.printf("[INIT] TTS: %s key missing, falling back to SAM\n",
-                                  config_portal_get_tts_mode().c_str());
-                }
-            } else if (tts_mode_str == "elevenlabs") {
-                String tts_key = config_portal_get_tts_key();
-                if (tts_key.length() > 0) {
-                    tts_elevenlabs_init(tts_key);
-                    tts_elevenlabs_set_voice(config_portal_get_tts_voice());
-                    Serial.println("[INIT] TTS: ElevenLabs");
-                } else {
-                    tts_mode_str = "sam";
-                    tts_init();
-                    Serial.println("[INIT] TTS: ElevenLabs key missing, falling back to SAM");
-                }
-            } else if (tts_mode_str != "off") {
-                tts_mode_str = "sam";
-                tts_init();
-                Serial.println("[INIT] TTS: SAM (local)");
-            } else {
-                Serial.println("[INIT] TTS: Off");
-            }
         }
+
+        /* ── Apply all provider settings ────────────────────── */
+        apply_provider_settings();
 
         magic8ball_ui_set_answer("TAP TO\nASK");
     } else {

@@ -657,6 +657,13 @@ static void handleSaveWifi()
     ESP.restart();
 }
 
+static void (*settings_changed_cb)(void) = NULL;
+
+void config_portal_set_settings_changed_cb(void (*cb)(void))
+{
+    settings_changed_cb = cb;
+}
+
 static void handleSaveApi()
 {
     llm_provider = web.arg("llm_provider");
@@ -690,10 +697,7 @@ static void handleSaveApi()
     prefs.putString("tts_voice", tts_voice);
     prefs.end();
 
-    /* Apply model change live */
-    if (api_key.length() > 0) {
-        llm_init(api_url, api_key, model_name);
-    }
+    if (settings_changed_cb) settings_changed_cb();
 
     web.send(200, "text/plain", "Provider settings saved!");
 }
@@ -726,6 +730,7 @@ static void handleSaveKeys()
     /* Update derived api_url/api_key in case the active provider's key changed */
     api_url = url_for_provider(llm_provider);
     api_key = key_for_provider(llm_provider);
+    if (settings_changed_cb) settings_changed_cb();
 
     web.send(200, "text/plain", "API keys saved!");
 }

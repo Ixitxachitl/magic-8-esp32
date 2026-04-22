@@ -149,10 +149,29 @@ static void stt_task(void *param)
                 http.addHeader("Authorization", "Bearer " + cfg_key);
             http.setTimeout(30000);
 
-            unsigned long t0 = millis();
-            int code = http.sendRequest("POST", body, body_len);
-            unsigned long elapsed = millis() - t0;
-            Serial.printf("[STT] HTTP %d  (%lu ms)\n", code, elapsed);
+            int code = -1;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                unsigned long t0 = millis();
+                code = http.sendRequest("POST", body, body_len);
+                unsigned long elapsed = millis() - t0;
+                Serial.printf("[STT] HTTP %d  (%lu ms)\n", code, elapsed);
+                if (code > 0) break;
+                if (attempt == 0) {
+                    Serial.println("[STT] Send failed, retrying in 500ms...");
+                    delay(500);
+                    /* Re-open the connection for retry */
+                    http.end();
+                    delete client;
+                    client = new WiFiClientSecure();
+                    client->setInsecure();
+                    if (!http.begin(*client, url)) break;
+                    http.addHeader("Content-Type",
+                                   String("multipart/form-data; boundary=") + BOUNDARY);
+                    if (cfg_key.length() > 0)
+                        http.addHeader("Authorization", "Bearer " + cfg_key);
+                    http.setTimeout(30000);
+                }
+            }
 
             if (code == 200) {
                 result = http.getString();

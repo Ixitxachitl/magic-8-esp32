@@ -17,3 +17,6 @@ String config_portal_get_stt_url(void);
 String config_portal_get_stt_key(void);
 String config_portal_get_tts_key(void);
 String config_portal_get_tts_url(void);
+
+/* Called whenever provider or key settings are saved from the portal */
+void config_portal_set_settings_changed_cb(void (*cb)(void));
