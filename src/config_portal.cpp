@@ -45,6 +45,7 @@ static String custom_url;       /* user-supplied base URL for "custom" */
 /* provider selections */
 static String llm_provider;     /* "groq", "gemini", "openai", "custom" */
 static String stt_provider;     /* "groq", "openai" */
+static String stt_model;        /* e.g. "distil-whisper-large-v3-en" */
 
 static const char DEFAULT_SYS_PROMPT[] =
     "You are a mystical Magic 8 Ball. Give a brief, mysterious answer "
@@ -184,9 +185,18 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <select id="stt_provider">
   <option value="groq" {{SP_GROQ}}>Groq (Whisper)</option>
   <option value="openai" {{SP_OPENAI}}>OpenAI (Whisper)</option>
-
 </select>
-<p class="note">STT uses the Whisper API. Groq and OpenAI are supported.</p>
+<div class="row">
+  <div>
+    <label>STT Model</label>
+    <select id="stt_model_sel">
+      <option value="{{STT_MODEL}}">{{STT_MODEL}}</option>
+    </select>
+  </div>
+  <button class="btn btn-teal btn-sm" type="button" onclick="scanSttModels()"
+    style="width:90px;margin-bottom:1px" id="sttModelBtn">Scan</button>
+</div>
+<p class="note" id="stt_model_note">Click Scan to fetch available Whisper models from the selected STT provider.</p>
 
 <h2>&#x1F50A; Text-to-Speech</h2>
 <label>TTS Engine</label>
@@ -299,6 +309,7 @@ function saveProviders(){
   var d='llm_provider='+encodeURIComponent(document.getElementById('llm_provider').value)
        +'&model='+encodeURIComponent(document.getElementById('model_sel').value)
        +'&stt_provider='+encodeURIComponent(document.getElementById('stt_provider').value)
+       +'&stt_model='+encodeURIComponent(document.getElementById('stt_model_sel').value)
        +'&tts_mode='+encodeURIComponent(ttsMode)
        +'&tts_voice='+encodeURIComponent(voice);
   postForm('/save_api',d,document.getElementById('api_msg'),'Provider settings saved!');
@@ -358,6 +369,35 @@ function scanModels(){
       });
       btn.disabled=false;btn.textContent='Scan';
       note.textContent='Found '+list.length+' models.';
+    }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
+}
+function getSttKey(){
+  var prov=document.getElementById('stt_provider').value;
+  var el=document.getElementById('key_'+prov);
+  return el?el.value:'';
+}
+function scanSttModels(){
+  var btn=document.getElementById('sttModelBtn');
+  var note=document.getElementById('stt_model_note');
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  note.textContent='Fetching models...';
+  var prov=document.getElementById('stt_provider').value;
+  var key=getSttKey();
+  fetch('/scan_stt_models?stt_provider='+encodeURIComponent(prov)+'&api_key='+encodeURIComponent(key))
+    .then(function(r){return r.json()})
+    .then(function(list){
+      var sel=document.getElementById('stt_model_sel');
+      var cur=sel.value;
+      sel.innerHTML='';
+      if(list.length===0){sel.innerHTML='<option value="">No models found</option>';btn.disabled=false;btn.textContent='Scan';note.textContent='No Whisper models found.';return;}
+      list.forEach(function(m){
+        var o=document.createElement('option');o.value=m.id;
+        o.textContent=m.id;
+        if(m.id===cur)o.selected=true;
+        sel.appendChild(o);
+      });
+      btn.disabled=false;btn.textContent='Scan';
+      note.textContent='Found '+list.length+' model(s).';
     }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
 }
 /* show/hide custom URL row */
@@ -427,6 +467,7 @@ static void handleRoot()
     /* STT provider */
     page.replace("{{SP_GROQ}}",   stt_provider == "groq"   ? "selected" : "");
     page.replace("{{SP_OPENAI}}", stt_provider == "openai" ? "selected" : "");
+    page.replace("{{STT_MODEL}}", htmlEscape(stt_model));
     /* System prompt */
     page.replace("{{SYS_PROMPT}}", htmlEscape(system_prompt));
     /* TTS mode selection */
@@ -639,6 +680,64 @@ static void handleScanModels()
     web.send(200, "application/json", json);
 }
 
+static void handleScanSttModels()
+{
+    String prov = web.arg("stt_provider");
+    String key  = web.arg("api_key");
+    if (prov.length() == 0) prov = stt_provider;
+
+    String url;
+    if (prov == "openai") url = "https://api.openai.com/v1";
+    else                  url = "https://api.groq.com/openai/v1";
+
+    Serial.printf("[PORTAL] STT model scan: provider=%s\n", prov.c_str());
+
+    String json = "[";
+    int count = 0;
+
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        String endpoint = url + "/models";
+
+        if (http.begin(client, endpoint)) {
+            if (key.length() > 0)
+                http.addHeader("Authorization", "Bearer " + key);
+            http.setTimeout(10000);
+
+            int code = http.GET();
+            Serial.printf("[PORTAL] STT models HTTP %d\n", code);
+
+            if (code == 200) {
+                String body = http.getString();
+                JsonDocument doc;
+                DeserializationError err = deserializeJson(doc, body);
+                body = "";
+                if (!err && doc["data"].is<JsonArray>()) {
+                    for (JsonObject m : doc["data"].as<JsonArray>()) {
+                        const char *id = m["id"] | "";
+                        if (!id[0]) continue;
+                        /* Keep only Whisper / distil-whisper / transcription models */
+                        if (strstr(id, "whisper") || strstr(id, "distil-whisper")) {
+                            if (count > 0) json += ",";
+                            json += "{\"id\":\"";
+                            json += id;
+                            json += "\"}";
+                            count++;
+                        }
+                    }
+                }
+            }
+            http.end();
+        }
+    }
+
+    json += "]";
+    Serial.printf("[PORTAL] Returning %d STT models\n", count);
+    web.send(200, "application/json", json);
+}
+
 static void handleSaveWifi()
 {
     wifi_ssid = web.arg("ssid");
@@ -669,11 +768,13 @@ static void handleSaveApi()
     llm_provider = web.arg("llm_provider");
     model_name   = web.arg("model");
     stt_provider = web.arg("stt_provider");
+    stt_model    = web.arg("stt_model");
     tts_mode     = web.arg("tts_mode");
     tts_voice    = web.arg("tts_voice");
     if (llm_provider.length() == 0) llm_provider = "groq";
     if (model_name.length() == 0)   model_name   = "llama-3.3-70b-versatile";
     if (stt_provider.length() == 0) stt_provider = "groq";
+    if (stt_model.length() == 0)    stt_model    = (stt_provider == "openai") ? "whisper-1" : "whisper-large-v3-turbo";
     if (tts_mode.length() == 0)     tts_mode     = "sam";
     if (tts_voice.length() == 0)    tts_voice    = "tara";
 
@@ -684,12 +785,13 @@ static void handleSaveApi()
     Serial.println("[PORTAL] Saving provider settings:");
     Serial.printf("[PORTAL]   LLM:   %s → %s\n", llm_provider.c_str(), api_url.c_str());
     Serial.printf("[PORTAL]   Model: %s\n", model_name.c_str());
-    Serial.printf("[PORTAL]   STT:   %s\n", stt_provider.c_str());
+    Serial.printf("[PORTAL]   STT:   %s / %s\n", stt_provider.c_str(), stt_model.c_str());
     Serial.printf("[PORTAL]   TTS:   %s / %s\n", tts_mode.c_str(), tts_voice.c_str());
 
     prefs.begin("m8b", false);
     prefs.putString("llm_prov",  llm_provider);
     prefs.putString("stt_prov",  stt_provider);
+    prefs.putString("stt_model", stt_model);
     prefs.putString("api_url",   api_url);
     prefs.putString("api_key",   api_key);
     prefs.putString("model",     model_name);
@@ -786,6 +888,7 @@ void config_portal_begin(void)
     /* provider selections */
     llm_provider  = prefs.getString("llm_prov",  "groq");
     stt_provider  = prefs.getString("stt_prov",  "groq");
+    stt_model     = prefs.getString("stt_model", "");
     /* derived URL/key (or legacy fallback) */
     api_url       = url_for_provider(llm_provider);
     api_key       = key_for_provider(llm_provider);
@@ -797,10 +900,14 @@ void config_portal_begin(void)
     tts_voice     = prefs.getString("tts_voice", "tara");
     prefs.end();
 
+    /* Default STT model based on provider if not yet saved */
+    if (stt_model.length() == 0)
+        stt_model = (stt_provider == "openai") ? "whisper-1" : "whisper-large-v3-turbo";
+
     Serial.println("[PORTAL] Loaded NVS settings:");
     Serial.printf("[PORTAL]   SSID:  '%s'\n", wifi_ssid.c_str());
     Serial.printf("[PORTAL]   LLM:   %s → %s\n", llm_provider.c_str(), api_url.c_str());
-    Serial.printf("[PORTAL]   STT:   %s\n", stt_provider.c_str());
+    Serial.printf("[PORTAL]   STT:   %s / %s\n", stt_provider.c_str(), stt_model.c_str());
     Serial.printf("[PORTAL]   Model: %s\n", model_name.c_str());
     Serial.printf("[PORTAL]   Keys:  groq=%d gemini=%d openai=%d 11l=%d custom=%d\n",
                   key_groq.length(), key_gemini.length(),
@@ -834,13 +941,14 @@ void config_portal_begin(void)
         config_portal_start_ap();
     }
 
-    web.on("/",            HTTP_GET,  handleRoot);
-    web.on("/scan_wifi",   HTTP_GET,  handleScanWifi);
-    web.on("/scan_models", HTTP_GET,  handleScanModels);
-    web.on("/save_wifi",   HTTP_POST, handleSaveWifi);
-    web.on("/save_keys",   HTTP_POST, handleSaveKeys);
-    web.on("/save_api",    HTTP_POST, handleSaveApi);
-    web.on("/save_prompt", HTTP_POST, handleSavePrompt);
+    web.on("/",                HTTP_GET,  handleRoot);
+    web.on("/scan_wifi",       HTTP_GET,  handleScanWifi);
+    web.on("/scan_models",     HTTP_GET,  handleScanModels);
+    web.on("/scan_stt_models", HTTP_GET,  handleScanSttModels);
+    web.on("/save_wifi",       HTTP_POST, handleSaveWifi);
+    web.on("/save_keys",       HTTP_POST, handleSaveKeys);
+    web.on("/save_api",        HTTP_POST, handleSaveApi);
+    web.on("/save_prompt",     HTTP_POST, handleSavePrompt);
     web.onNotFound(handleNotFound);
     web.begin();
     Serial.println("[PORTAL] Web server started on port 80");
@@ -861,6 +969,7 @@ String config_portal_get_system_prompt(void) { return system_prompt; }
 String config_portal_get_tts_mode(void)      { return tts_mode; }
 String config_portal_get_tts_voice(void)     { return tts_voice; }
 String config_portal_get_stt_provider(void)  { return stt_provider; }
+String config_portal_get_stt_model(void)     { return stt_model;    }
 String config_portal_get_stt_url(void)       { return url_for_provider(stt_provider); }
 String config_portal_get_stt_key(void)       { return key_for_provider(stt_provider); }
 String config_portal_get_tts_key(void) {

@@ -30,12 +30,11 @@ struct SttTaskParams {
 
 static const char *BOUNDARY = "ESP32AudioBndry";
 
-/* ── WAV header helper (44 bytes, 16 kHz mono 16-bit PCM) ──────── */
-static void write_wav_header(uint8_t *dst, size_t data_bytes)
+/* ── WAV header helper (44 bytes, mono 16-bit PCM) ────────────── */
+static void write_wav_header(uint8_t *dst, size_t data_bytes, uint32_t sr)
 {
     uint32_t file_sz  = data_bytes + 36;
-    uint32_t sr       = 16000;
-    uint32_t byte_rt  = 32000;     /* sr * 1 * 2 */
+    uint32_t byte_rt  = sr * 2;    /* sr * channels * (bps/8) */
     uint16_t blk_alg  = 2;
     uint16_t bps      = 16;
     uint16_t channels = 1;
@@ -58,10 +57,14 @@ static void write_wav_header(uint8_t *dst, size_t data_bytes)
 }
 
 /* ── build multipart/form-data body into `dst` ─────────────────── */
+/* Downsamples 16 kHz input → 8 kHz for upload (halves payload size). */
 static size_t build_body(uint8_t *dst, const int16_t *samples, size_t count)
 {
     size_t pos = 0;
-    size_t pcm_bytes = count * sizeof(int16_t);
+
+    /* 2:1 decimation: 16 kHz → 8 kHz */
+    size_t ds_count  = count / 2;
+    size_t pcm_bytes = ds_count * sizeof(int16_t);
 
 #define APPEND_STR(s) do { size_t l = strlen(s); memcpy(dst + pos, s, l); pos += l; } while(0)
 
@@ -70,10 +73,12 @@ static size_t build_body(uint8_t *dst, const int16_t *samples, size_t count)
     APPEND_STR("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n");
     APPEND_STR("Content-Type: audio/wav\r\n\r\n");
 
-    write_wav_header(dst + pos, pcm_bytes);
+    write_wav_header(dst + pos, pcm_bytes, 8000);
     pos += 44;
-    memcpy(dst + pos, samples, pcm_bytes);
-    pos += pcm_bytes;
+    for (size_t i = 0; i < ds_count; i++) {
+        memcpy(dst + pos, &samples[i * 2], sizeof(int16_t));
+        pos += sizeof(int16_t);
+    }
     APPEND_STR("\r\n");
 
     /* Part 2 – model */
@@ -114,7 +119,7 @@ static void stt_task(void *param)
                   (float)p->sample_count / 16000.0f);
 
     /* alloc body buffer in PSRAM */
-    size_t pcm_bytes  = p->sample_count * sizeof(int16_t);
+    size_t pcm_bytes  = (p->sample_count / 2) * sizeof(int16_t);  /* 8 kHz downsampled */
     size_t body_alloc = pcm_bytes + 44 + 1024;          /* WAV + multipart overhead */
     uint8_t *body = (uint8_t *)heap_caps_malloc(body_alloc, MALLOC_CAP_SPIRAM);
     if (!body) {
@@ -206,18 +211,19 @@ done:
 
 /* ── public API ────────────────────────────────────────────────── */
 
-void stt_init(const String &api_url, const String &api_key)
+void stt_init(const String &api_url, const String &api_key, const String &model)
 {
-    cfg_url = api_url;
-    cfg_key = api_key;
-    /* Pick the right Whisper model based on provider URL */
-    if (api_url.indexOf("openai.com") >= 0) {
-        cfg_model = "whisper-1";
-    } else {
-        cfg_model = "whisper-large-v3-turbo";
+    cfg_url   = api_url;
+    cfg_key   = api_key;
+    cfg_model = model;
+    if (cfg_model.length() == 0) {
+        /* Fallback default if caller passes an empty string */
+        cfg_model = (api_url.indexOf("openai.com") >= 0)
+                    ? "whisper-1"
+                    : "whisper-large-v3-turbo";
     }
     if (!stt_mutex) stt_mutex = xSemaphoreCreateMutex();
-    Serial.println("[STT] Initialized");
+    Serial.printf("[STT] Initialized: model=%s\n", cfg_model.c_str());
     Serial.printf("[STT]   URL: %s  model: %s\n", api_url.c_str(), cfg_model.c_str());
 }
 

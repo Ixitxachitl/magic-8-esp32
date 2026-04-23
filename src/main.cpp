@@ -218,8 +218,10 @@ static void apply_provider_settings()
         String stt_url = config_portal_get_stt_url();
         String stt_key = config_portal_get_stt_key();
         if (stt_key.length() > 0 && stt_url.length() > 0) {
-            stt_init(stt_url, stt_key);
-            Serial.printf("[SETTINGS] STT: %s\n", config_portal_get_stt_provider().c_str());
+            stt_init(stt_url, stt_key, config_portal_get_stt_model());
+            Serial.printf("[SETTINGS] STT: %s / %s\n",
+                          config_portal_get_stt_provider().c_str(),
+                          config_portal_get_stt_model().c_str());
         } else {
             Serial.println("[SETTINGS] STT disabled (no key)");
         }
