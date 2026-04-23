@@ -40,6 +40,7 @@ static String key_gemini;
 static String key_openai;
 static String key_elevenlabs;
 static String key_custom;
+static String key_deepgram;
 static String custom_url;       /* user-supplied base URL for "custom" */
 
 /* provider selections */
@@ -60,18 +61,20 @@ static const char DEFAULT_SYS_PROMPT[] =
 
 /* ── provider URL table ────────────────────────────────────────── */
 static String url_for_provider(const String &prov) {
-    if (prov == "groq")   return "https://api.groq.com/openai/v1";
-    if (prov == "gemini") return "https://generativelanguage.googleapis.com/v1beta/openai";
-    if (prov == "openai") return "https://api.openai.com/v1";
-    if (prov == "custom") return custom_url;
+    if (prov == "groq")      return "https://api.groq.com/openai/v1";
+    if (prov == "gemini")    return "https://generativelanguage.googleapis.com/v1beta/openai";
+    if (prov == "openai")    return "https://api.openai.com/v1";
+    if (prov == "custom")    return custom_url;
+    if (prov == "deepgram")  return "https://api.deepgram.com/v1";
     return "";
 }
 
 static String key_for_provider(const String &prov) {
-    if (prov == "groq")   return key_groq;
-    if (prov == "gemini") return key_gemini;
-    if (prov == "openai") return key_openai;
-    if (prov == "custom") return key_custom;
+    if (prov == "groq")      return key_groq;
+    if (prov == "gemini")    return key_gemini;
+    if (prov == "openai")    return key_openai;
+    if (prov == "custom")    return key_custom;
+    if (prov == "deepgram")  return key_deepgram;
     return "";
 }
 
@@ -156,6 +159,7 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <tr><td>Gemini</td><td><input id="key_gemini" type="password" value="{{KEY_GEMINI}}" placeholder="AIza..."></td></tr>
 <tr><td>OpenAI</td><td><input id="key_openai" type="password" value="{{KEY_OPENAI}}" placeholder="sk-..."></td></tr>
 <tr><td>ElevenLabs</td><td><input id="key_elevenlabs" type="password" value="{{KEY_11L}}" placeholder="xi-..."></td></tr>
+<tr><td>Deepgram</td><td><input id="key_deepgram" type="password" value="{{KEY_DEEPGRAM}}" placeholder="deepgram_..."></td></tr>
 </table>
 <button class="btn btn-blue" type="button" onclick="saveKeys()">Save API Keys</button>
 <p id="keys_msg" class="msg" style="color:#4a8"></p>
@@ -191,6 +195,7 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <select id="stt_provider" onchange="updateSttCustom()">
   <option value="groq" {{SP_GROQ}}>Groq (Whisper)</option>
   <option value="openai" {{SP_OPENAI}}>OpenAI (Whisper)</option>
+  <option value="deepgram" {{SP_DEEPGRAM}}>Deepgram (Nova)</option>
   <option value="custom" {{SP_CUSTOM}}>Custom (OpenAI-compatible)</option>
 </select>
 <div id="stt_custom_row" class="custom-row">
@@ -321,6 +326,7 @@ function saveKeys(){
        +'&key_gemini='+encodeURIComponent(document.getElementById('key_gemini').value)
        +'&key_openai='+encodeURIComponent(document.getElementById('key_openai').value)
        +'&key_elevenlabs='+encodeURIComponent(document.getElementById('key_elevenlabs').value)
+       +'&key_deepgram='+encodeURIComponent(document.getElementById('key_deepgram').value)
        +'&key_custom='+encodeURIComponent(document.getElementById('key_custom').value)
        +'&custom_url='+encodeURIComponent(document.getElementById('custom_url').value);
   postForm('/save_keys',d,document.getElementById('keys_msg'),'API keys saved!');
@@ -410,31 +416,24 @@ function scanModels(){
 }
 function getSttKey(){
   var prov=document.getElementById('stt_provider').value;
-  if(prov==='custom') return document.getElementById('stt_custom_key').value;
+  if(prov==='custom')   return document.getElementById('stt_custom_key').value;
+  if(prov==='deepgram') return document.getElementById('key_deepgram').value;
   var el=document.getElementById('key_'+prov);
   return el?el.value:'';
 }
 function scanSttModels(){
+  var prov=document.getElementById('stt_provider').value;
+  if(prov==='deepgram'){populateSttModels(DG_MODELS);return;}
   var btn=document.getElementById('sttModelBtn');
   var note=document.getElementById('stt_model_note');
   btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
   note.textContent='Fetching models...';
-  var prov=document.getElementById('stt_provider').value;
   var key=getSttKey();
   var customUrl=(prov==='custom')?document.getElementById('stt_custom_url').value:'';
   fetch('/scan_stt_models?stt_provider='+encodeURIComponent(prov)+'&api_key='+encodeURIComponent(key)+'&custom_url='+encodeURIComponent(customUrl))
     .then(function(r){return r.json()})
     .then(function(list){
-      var sel=document.getElementById('stt_model_sel');
-      var cur=sel.value;
-      sel.innerHTML='';
-      if(list.length===0){sel.innerHTML='<option value="">No models found</option>';btn.disabled=false;btn.textContent='Scan';note.textContent='No Whisper models found.';return;}
-      list.forEach(function(m){
-        var o=document.createElement('option');o.value=m.id;
-        o.textContent=m.id;
-        if(m.id===cur)o.selected=true;
-        sel.appendChild(o);
-      });
+      populateSttModels(list.map(function(m){return m.id;}));
       btn.disabled=false;btn.textContent='Scan';
       note.textContent='Found '+list.length+' model(s).';
     }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
@@ -463,6 +462,18 @@ function scanTtsModels(){
       note.textContent='Found '+list.length+' model(s).';
     }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
 }
+var DG_MODELS=['nova-3','nova-2','nova-2-general','nova-2-meeting','nova-2-phonecall','nova','enhanced','base'];
+function populateSttModels(list){
+  var sel=document.getElementById('stt_model_sel');
+  var cur=sel.value;
+  sel.innerHTML='';
+  list.forEach(function(id){
+    var o=document.createElement('option');o.value=id;o.textContent=id;
+    if(id===cur)o.selected=true;
+    sel.appendChild(o);
+  });
+  if(!sel.value&&list.length>0)sel.value=list[0];
+}
 /* show/hide custom URL row */
 function updateCustom(){
   var v=document.getElementById('llm_provider').value;
@@ -471,6 +482,16 @@ function updateCustom(){
 function updateSttCustom(){
   var v=document.getElementById('stt_provider').value;
   document.getElementById('stt_custom_row').style.display=(v==='custom')?'block':'none';
+  var btn=document.getElementById('sttModelBtn');
+  var note=document.getElementById('stt_model_note');
+  if(v==='deepgram'){
+    btn.style.display='none';
+    populateSttModels(DG_MODELS);
+    note.textContent='Deepgram model list (hardcoded).';
+  } else {
+    btn.style.display='';
+    note.textContent='Click Scan to fetch available Whisper models from the selected STT provider.';
+  }
 }
 document.getElementById('llm_provider').addEventListener('change',updateCustom);
 document.getElementById('stt_provider').addEventListener('change',updateSttCustom);
@@ -513,12 +534,13 @@ static void handleRoot()
     page.replace("{{SSID}}", htmlEscape(wifi_ssid));
     page.replace("{{PASS}}", htmlEscape(wifi_pass));
     /* API keys */
-    page.replace("{{KEY_GROQ}}",   htmlEscape(key_groq));
-    page.replace("{{KEY_GEMINI}}", htmlEscape(key_gemini));
-    page.replace("{{KEY_OPENAI}}", htmlEscape(key_openai));
-    page.replace("{{KEY_11L}}",    htmlEscape(key_elevenlabs));
-    page.replace("{{KEY_CUSTOM}}", htmlEscape(key_custom));
-    page.replace("{{CUSTOM_URL}}", htmlEscape(custom_url));
+    page.replace("{{KEY_GROQ}}",      htmlEscape(key_groq));
+    page.replace("{{KEY_GEMINI}}",    htmlEscape(key_gemini));
+    page.replace("{{KEY_OPENAI}}",    htmlEscape(key_openai));
+    page.replace("{{KEY_11L}}",       htmlEscape(key_elevenlabs));
+    page.replace("{{KEY_DEEPGRAM}}",  htmlEscape(key_deepgram));
+    page.replace("{{KEY_CUSTOM}}",    htmlEscape(key_custom));
+    page.replace("{{CUSTOM_URL}}",    htmlEscape(custom_url));
     /* LLM provider */
     page.replace("{{LP_GROQ}}",   llm_provider == "groq"   ? "selected" : "");
     page.replace("{{LP_GEMINI}}", llm_provider == "gemini" ? "selected" : "");
@@ -526,9 +548,10 @@ static void handleRoot()
     page.replace("{{LP_CUSTOM}}", llm_provider == "custom" ? "selected" : "");
     page.replace("{{MODEL}}", htmlEscape(model_name));
     /* STT provider */
-    page.replace("{{SP_GROQ}}",   stt_provider == "groq"   ? "selected" : "");
-    page.replace("{{SP_OPENAI}}", stt_provider == "openai" ? "selected" : "");
-    page.replace("{{SP_CUSTOM}}", stt_provider == "custom" ? "selected" : "");
+    page.replace("{{SP_GROQ}}",    stt_provider == "groq"     ? "selected" : "");
+    page.replace("{{SP_OPENAI}}",  stt_provider == "openai"   ? "selected" : "");
+    page.replace("{{SP_DEEPGRAM}}",stt_provider == "deepgram" ? "selected" : "");
+    page.replace("{{SP_CUSTOM}}",  stt_provider == "custom"   ? "selected" : "");
     page.replace("{{STT_MODEL}}", htmlEscape(stt_model));
     page.replace("{{STT_CUSTOM_URL}}", htmlEscape(stt_custom_url));
     page.replace("{{STT_CUSTOM_KEY}}", htmlEscape(stt_custom_key));
@@ -757,29 +780,42 @@ static void handleScanSttModels()
     if (prov.length() == 0) prov = stt_provider;
 
     String url;
-    if (prov == "openai")      url = "https://api.openai.com/v1";
-    else if (prov == "custom") url = custom_url_arg.length() > 0 ? custom_url_arg : stt_custom_url;
-    else                       url = "https://api.groq.com/openai/v1";
+    if (prov == "openai")       url = "https://api.openai.com/v1";
+    else if (prov == "deepgram") url = "https://api.deepgram.com/v1";
+    else if (prov == "custom")  url = custom_url_arg.length() > 0 ? custom_url_arg : stt_custom_url;
+    else                        url = "https://api.groq.com/openai/v1";
 
     Serial.printf("[PORTAL] STT model scan: provider=%s\n", prov.c_str());
 
     String json = "[";
     int count = 0;
 
-    {
+    /* Deepgram: return hardcoded model list — their /v1/models response is
+       hundreds of KB and would OOM the ESP32 heap when parsed. The available
+       transcription models are stable and well-documented. */
+    if (prov == "deepgram") {
+        static const char * const DG_MODELS[] = {
+            "nova-3", "nova-2", "nova-2-general", "nova-2-meeting",
+            "nova-2-phonecall", "nova", "enhanced", "base"
+        };
+        for (size_t i = 0; i < sizeof(DG_MODELS)/sizeof(DG_MODELS[0]); i++) {
+            if (count > 0) json += ",";
+            json += "{\"id\":\"";
+            json += DG_MODELS[i];
+            json += "\"}";
+            count++;
+        }
+    } else {
         WiFiClientSecure client;
         client.setInsecure();
         HTTPClient http;
         String endpoint = url + "/models";
-
         if (http.begin(client, endpoint)) {
             if (key.length() > 0)
                 http.addHeader("Authorization", "Bearer " + key);
             http.setTimeout(10000);
-
             int code = http.GET();
             Serial.printf("[PORTAL] STT models HTTP %d\n", code);
-
             if (code == 200) {
                 String body = http.getString();
                 JsonDocument doc;
@@ -789,7 +825,6 @@ static void handleScanSttModels()
                     for (JsonObject m : doc["data"].as<JsonArray>()) {
                         const char *id = m["id"] | "";
                         if (!id[0]) continue;
-                        /* Keep only Whisper / distil-whisper / transcription models */
                         if (strstr(id, "whisper") || strstr(id, "distil-whisper")) {
                             if (count > 0) json += ",";
                             json += "{\"id\":\"";
@@ -907,7 +942,9 @@ static void handleSaveApi()
     if (llm_provider.length() == 0) llm_provider = "groq";
     if (model_name.length() == 0)   model_name   = "llama-3.3-70b-versatile";
     if (stt_provider.length() == 0) stt_provider = "groq";
-    if (stt_model.length() == 0)    stt_model    = (stt_provider == "openai") ? "whisper-1" : "whisper-large-v3-turbo";
+    if (stt_model.length() == 0)    stt_model    = (stt_provider == "openai") ? "whisper-1" :
+                                                   (stt_provider == "deepgram") ? "nova-3" :
+                                                   "whisper-large-v3-turbo";
     if (tts_mode.length() == 0)     tts_mode     = "sam";
     if (tts_voice.length() == 0)    tts_voice    = "tara";
 
@@ -944,27 +981,30 @@ static void handleSaveApi()
 
 static void handleSaveKeys()
 {
-    key_groq   = web.arg("key_groq");
-    key_gemini = web.arg("key_gemini");
-    key_openai = web.arg("key_openai");
+    key_groq       = web.arg("key_groq");
+    key_gemini     = web.arg("key_gemini");
+    key_openai     = web.arg("key_openai");
     key_elevenlabs = web.arg("key_elevenlabs");
-    key_custom = web.arg("key_custom");
-    custom_url = web.arg("custom_url");
+    key_deepgram   = web.arg("key_deepgram");
+    key_custom     = web.arg("key_custom");
+    custom_url     = web.arg("custom_url");
 
     Serial.println("[PORTAL] Saving API keys:");
-    Serial.printf("[PORTAL]   Groq:   %d chars\n", key_groq.length());
-    Serial.printf("[PORTAL]   Gemini: %d chars\n", key_gemini.length());
-    Serial.printf("[PORTAL]   OpenAI: %d chars\n", key_openai.length());
-    Serial.printf("[PORTAL]   11Labs: %d chars\n", key_elevenlabs.length());
-    Serial.printf("[PORTAL]   Custom: %d chars (URL: %s)\n", key_custom.length(), custom_url.c_str());
+    Serial.printf("[PORTAL]   Groq:     %d chars\n", key_groq.length());
+    Serial.printf("[PORTAL]   Gemini:   %d chars\n", key_gemini.length());
+    Serial.printf("[PORTAL]   OpenAI:   %d chars\n", key_openai.length());
+    Serial.printf("[PORTAL]   11Labs:   %d chars\n", key_elevenlabs.length());
+    Serial.printf("[PORTAL]   Deepgram: %d chars\n", key_deepgram.length());
+    Serial.printf("[PORTAL]   Custom:   %d chars (URL: %s)\n", key_custom.length(), custom_url.c_str());
 
     prefs.begin("m8b", false);
-    prefs.putString("key_groq",   key_groq);
-    prefs.putString("key_gemini", key_gemini);
-    prefs.putString("key_openai", key_openai);
-    prefs.putString("key_11l",    key_elevenlabs);
-    prefs.putString("key_custom", key_custom);
-    prefs.putString("custom_url", custom_url);
+    prefs.putString("key_groq",      key_groq);
+    prefs.putString("key_gemini",    key_gemini);
+    prefs.putString("key_openai",    key_openai);
+    prefs.putString("key_11l",       key_elevenlabs);
+    prefs.putString("key_deepgram",  key_deepgram);
+    prefs.putString("key_custom",    key_custom);
+    prefs.putString("custom_url",    custom_url);
     prefs.end();
 
     /* Update derived api_url/api_key in case the active provider's key changed */
@@ -1017,12 +1057,13 @@ void config_portal_begin(void)
     wifi_ssid     = prefs.getString("ssid",    "");
     wifi_pass     = prefs.getString("pass",    "");
     /* per-service API keys */
-    key_groq      = prefs.getString("key_groq",   prefs.getString("api_key", ""));
-    key_gemini    = prefs.getString("key_gemini",  "");
-    key_openai    = prefs.getString("key_openai",  "");
-    key_elevenlabs = prefs.getString("key_11l",     "");
-    key_custom    = prefs.getString("key_custom",  "");
-    custom_url    = prefs.getString("custom_url",  "");
+    key_groq      = prefs.getString("key_groq",      prefs.getString("api_key", ""));
+    key_gemini    = prefs.getString("key_gemini",     "");
+    key_openai    = prefs.getString("key_openai",     "");
+    key_elevenlabs = prefs.getString("key_11l",       "");
+    key_deepgram  = prefs.getString("key_deepgram",   "");
+    key_custom    = prefs.getString("key_custom",     "");
+    custom_url    = prefs.getString("custom_url",     "");
     /* provider selections */
     llm_provider  = prefs.getString("llm_prov",  "groq");
     stt_provider  = prefs.getString("stt_prov",  "groq");
@@ -1045,7 +1086,9 @@ void config_portal_begin(void)
 
     /* Default STT model based on provider if not yet saved */
     if (stt_model.length() == 0)
-        stt_model = (stt_provider == "openai") ? "whisper-1" : "whisper-large-v3-turbo";
+        stt_model = (stt_provider == "openai") ? "whisper-1" :
+                    (stt_provider == "deepgram") ? "nova-3" :
+                    "whisper-large-v3-turbo";
 
     Serial.println("[PORTAL] Loaded NVS settings:");
     Serial.printf("[PORTAL]   SSID:  '%s'\n", wifi_ssid.c_str());
@@ -1115,11 +1158,13 @@ String config_portal_get_tts_voice(void)     { return tts_voice; }
 String config_portal_get_stt_provider(void)  { return stt_provider; }
 String config_portal_get_stt_model(void)     { return stt_model;    }
 String config_portal_get_stt_url(void) {
-    if (stt_provider == "custom") return stt_custom_url;
+    if (stt_provider == "custom")   return stt_custom_url;
+    if (stt_provider == "deepgram") return "https://api.deepgram.com/v1";
     return url_for_provider(stt_provider);
 }
 String config_portal_get_stt_key(void) {
-    if (stt_provider == "custom") return stt_custom_key;
+    if (stt_provider == "custom")   return stt_custom_key;
+    if (stt_provider == "deepgram") return key_deepgram;
     return key_for_provider(stt_provider);
 }
 String config_portal_get_tts_key(void) {

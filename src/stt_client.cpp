@@ -118,9 +118,12 @@ static void stt_task(void *param)
                   (unsigned)p->sample_count,
                   (float)p->sample_count / 16000.0f);
 
+    bool is_deepgram = (cfg_url.indexOf("deepgram.com") >= 0);
+
     /* alloc body buffer in PSRAM */
-    size_t pcm_bytes  = (p->sample_count / 2) * sizeof(int16_t);  /* 8 kHz downsampled */
-    size_t body_alloc = pcm_bytes + 44 + 1024;          /* WAV + multipart overhead */
+    size_t ds_count   = p->sample_count / 2;              /* 8 kHz after decimation */
+    size_t pcm_bytes  = ds_count * sizeof(int16_t);
+    size_t body_alloc = pcm_bytes + 44 + 1024;
     uint8_t *body = (uint8_t *)heap_caps_malloc(body_alloc, MALLOC_CAP_SPIRAM);
     if (!body) {
         Serial.println("[STT] Body alloc failed");
@@ -128,7 +131,64 @@ static void stt_task(void *param)
         goto done;
     }
 
-    {
+    if (is_deepgram) {
+        /* ── Deepgram: POST raw WAV to /v1/listen ──────────────────── */
+        write_wav_header(body, pcm_bytes, 8000);
+        size_t body_len = 44;
+        for (size_t i = 0; i < ds_count; i++) {
+            memcpy(body + body_len, &p->samples[i * 2], sizeof(int16_t));
+            body_len += sizeof(int16_t);
+        }
+        Serial.printf("[STT] Deepgram WAV body: %u bytes\n", (unsigned)body_len);
+
+        WiFiClientSecure *client = new WiFiClientSecure();
+        if (!client) { result = ""; heap_caps_free(body); goto done; }
+        client->setInsecure();
+
+        HTTPClient http;
+        String url = "https://api.deepgram.com/v1/listen"
+                     "?model=" + cfg_model +
+                     "&language=en&punctuate=true&smart_format=true";
+        Serial.printf("[STT] POST %s\n", url.c_str());
+
+        if (http.begin(*client, url)) {
+            http.addHeader("Content-Type", "audio/wav");
+            http.addHeader("Authorization", "Token " + cfg_key);
+            http.setTimeout(30000);
+
+            unsigned long t0 = millis();
+            int code = http.sendRequest("POST", body, body_len);
+            Serial.printf("[STT] Deepgram HTTP %d  (%lu ms)\n", code, millis() - t0);
+
+            if (code == 200) {
+                String body_str = http.getString();
+                Serial.printf("[STT] Deepgram response: %u bytes\n", (unsigned)body_str.length());
+                /* Extract transcript by string search — avoids JSON nesting depth issues.
+                   Deepgram always places "transcript":"..." as the first key in the
+                   alternatives object. */
+                int idx = body_str.indexOf("\"transcript\":\"");
+                if (idx >= 0) {
+                    int start = idx + 14;  /* skip past "transcript":" */
+                    int end   = body_str.indexOf('"', start);
+                    if (end > start)
+                        result = body_str.substring(start, end);
+                }
+                body_str = "";
+                result.trim();
+                Serial.printf("[STT] Deepgram transcript: \"%s\"\n", result.c_str());
+            } else {
+                Serial.printf("[STT] Deepgram error %d: %s\n", code, http.getString().c_str());
+                result = "";
+            }
+            http.end();
+        } else {
+            Serial.println("[STT] http.begin() failed");
+            result = "";
+        }
+        delete client;
+        heap_caps_free(body);
+    } else {
+        /* ── OpenAI-compatible: multipart/form-data ────────────────── */
         size_t body_len = build_body(body, p->samples, p->sample_count);
         Serial.printf("[STT] Body built: %u bytes\n", (unsigned)body_len);
 
@@ -164,7 +224,6 @@ static void stt_task(void *param)
                 if (attempt == 0) {
                     Serial.println("[STT] Send failed, retrying in 500ms...");
                     delay(500);
-                    /* Re-open the connection for retry */
                     http.end();
                     delete client;
                     client = new WiFiClientSecure();
