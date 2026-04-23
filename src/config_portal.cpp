@@ -44,8 +44,13 @@ static String custom_url;       /* user-supplied base URL for "custom" */
 
 /* provider selections */
 static String llm_provider;     /* "groq", "gemini", "openai", "custom" */
-static String stt_provider;     /* "groq", "openai" */
-static String stt_model;        /* e.g. "distil-whisper-large-v3-en" */
+static String stt_provider;     /* "groq", "openai", "custom" */
+static String stt_model;        /* e.g. "whisper-large-v3-turbo" */
+static String stt_custom_url;   /* base URL when stt_provider == "custom" */
+static String stt_custom_key;   /* API key  when stt_provider == "custom" */
+static String tts_custom_url;   /* base URL when tts_mode == "custom" */
+static String tts_custom_key;   /* API key  when tts_mode == "custom" */
+static String tts_model;        /* model    when tts_mode == "custom" */
 
 static const char DEFAULT_SYS_PROMPT[] =
     "You are a mystical Magic 8 Ball. Give a brief, mysterious answer "
@@ -151,12 +156,7 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <tr><td>Gemini</td><td><input id="key_gemini" type="password" value="{{KEY_GEMINI}}" placeholder="AIza..."></td></tr>
 <tr><td>OpenAI</td><td><input id="key_openai" type="password" value="{{KEY_OPENAI}}" placeholder="sk-..."></td></tr>
 <tr><td>ElevenLabs</td><td><input id="key_elevenlabs" type="password" value="{{KEY_11L}}" placeholder="xi-..."></td></tr>
-<tr><td>Custom</td><td><input id="key_custom" type="password" value="{{KEY_CUSTOM}}" placeholder="key for custom URL"></td></tr>
 </table>
-<div id="custom_url_row" class="custom-row">
-<label>Custom API Base URL</label>
-<input id="custom_url" value="{{CUSTOM_URL}}" placeholder="https://your-api.example.com/v1">
-</div>
 <button class="btn btn-blue" type="button" onclick="saveKeys()">Save API Keys</button>
 <p id="keys_msg" class="msg" style="color:#4a8"></p>
 
@@ -169,6 +169,12 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
   <option value="openai" {{LP_OPENAI}}>OpenAI</option>
   <option value="custom" {{LP_CUSTOM}}>Custom</option>
 </select>
+<div id="custom_url_row" class="custom-row">
+<label>Custom API Base URL</label>
+<input id="custom_url" value="{{CUSTOM_URL}}" placeholder="https://your-api.example.com/v1">
+<label>Custom API Key</label>
+<input id="key_custom" type="password" value="{{KEY_CUSTOM}}" placeholder="key for custom URL">
+</div>
 <div class="row">
   <div>
     <label>Model</label>
@@ -182,10 +188,17 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <p class="note" id="model_note">Click Scan to fetch available models from the selected LLM provider.</p>
 
 <label>STT Provider (Speech-to-Text)</label>
-<select id="stt_provider">
+<select id="stt_provider" onchange="updateSttCustom()">
   <option value="groq" {{SP_GROQ}}>Groq (Whisper)</option>
   <option value="openai" {{SP_OPENAI}}>OpenAI (Whisper)</option>
+  <option value="custom" {{SP_CUSTOM}}>Custom (OpenAI-compatible)</option>
 </select>
+<div id="stt_custom_row" class="custom-row">
+<label>Custom STT Base URL</label>
+<input id="stt_custom_url" value="{{STT_CUSTOM_URL}}" placeholder="https://your-api.example.com/v1">
+<label>Custom STT API Key</label>
+<input id="stt_custom_key" type="password" value="{{STT_CUSTOM_KEY}}" placeholder="API key">
+</div>
 <div class="row">
   <div>
     <label>STT Model</label>
@@ -205,6 +218,7 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
   <option value="groq" {{SEL_GROQ}}>Groq Orpheus (online, natural)</option>
   <option value="openai" {{SEL_OPENAI}}>OpenAI TTS (online, natural)</option>
   <option value="elevenlabs" {{SEL_11L}}>ElevenLabs (online, many voices)</option>
+  <option value="custom" {{SEL_CUSTOM_TTS}}>Custom (OpenAI-compatible)</option>
   <option value="off" {{SEL_OFF}}>Off</option>
 </select>
 <p class="note">SAM runs locally. Others use their respective API key.</p>
@@ -251,6 +265,24 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 <input id="tts_voice_11l_custom" value="{{EV_CUSTOM}}" placeholder="e.g. abc123def456">
 <p class="note">Browse voices at elevenlabs.io/voice-library</p>
 </div>
+</div>
+
+<div id="tts_custom_row" style="display:none">
+<label>Custom TTS Base URL</label>
+<input id="tts_custom_url" value="{{TTS_CUSTOM_URL}}" placeholder="https://your-api.example.com/v1">
+<label>Custom TTS API Key</label>
+<input id="tts_custom_key" type="password" value="{{TTS_CUSTOM_KEY}}" placeholder="API key">
+<div class="row">
+  <div>
+    <label>TTS Model</label>
+    <select id="tts_model_sel">
+      <option value="{{TTS_MODEL}}">{{TTS_MODEL}}</option>
+    </select>
+  </div>
+  <button class="btn btn-teal btn-sm" type="button" onclick="scanTtsModels()"
+    style="width:90px;margin-bottom:1px" id="ttsModelBtn">Scan</button>
+</div>
+<p class="note" id="tts_model_note">Click Scan to fetch available TTS models from the custom endpoint.</p>
 </div>
 
 <button class="btn btn-blue" type="button" onclick="saveProviders()">Save Provider Settings</button>
@@ -310,8 +342,13 @@ function saveProviders(){
        +'&model='+encodeURIComponent(document.getElementById('model_sel').value)
        +'&stt_provider='+encodeURIComponent(document.getElementById('stt_provider').value)
        +'&stt_model='+encodeURIComponent(document.getElementById('stt_model_sel').value)
+       +'&stt_custom_url='+encodeURIComponent(document.getElementById('stt_custom_url').value)
+       +'&stt_custom_key='+encodeURIComponent(document.getElementById('stt_custom_key').value)
        +'&tts_mode='+encodeURIComponent(ttsMode)
-       +'&tts_voice='+encodeURIComponent(voice);
+       +'&tts_voice='+encodeURIComponent(voice)
+       +'&tts_custom_url='+encodeURIComponent(document.getElementById('tts_custom_url').value)
+       +'&tts_custom_key='+encodeURIComponent(document.getElementById('tts_custom_key').value)
+       +'&tts_model='+encodeURIComponent(document.getElementById('tts_model_sel').value);
   postForm('/save_api',d,document.getElementById('api_msg'),'Provider settings saved!');
 }
 function savePrompt(){
@@ -373,6 +410,7 @@ function scanModels(){
 }
 function getSttKey(){
   var prov=document.getElementById('stt_provider').value;
+  if(prov==='custom') return document.getElementById('stt_custom_key').value;
   var el=document.getElementById('key_'+prov);
   return el?el.value:'';
 }
@@ -383,7 +421,8 @@ function scanSttModels(){
   note.textContent='Fetching models...';
   var prov=document.getElementById('stt_provider').value;
   var key=getSttKey();
-  fetch('/scan_stt_models?stt_provider='+encodeURIComponent(prov)+'&api_key='+encodeURIComponent(key))
+  var customUrl=(prov==='custom')?document.getElementById('stt_custom_url').value:'';
+  fetch('/scan_stt_models?stt_provider='+encodeURIComponent(prov)+'&api_key='+encodeURIComponent(key)+'&custom_url='+encodeURIComponent(customUrl))
     .then(function(r){return r.json()})
     .then(function(list){
       var sel=document.getElementById('stt_model_sel');
@@ -400,27 +439,49 @@ function scanSttModels(){
       note.textContent='Found '+list.length+' model(s).';
     }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
 }
+function scanTtsModels(){
+  var btn=document.getElementById('ttsModelBtn');
+  var note=document.getElementById('tts_model_note');
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  note.textContent='Fetching models...';
+  var url=document.getElementById('tts_custom_url').value;
+  var key=document.getElementById('tts_custom_key').value;
+  fetch('/scan_tts_models?custom_url='+encodeURIComponent(url)+'&api_key='+encodeURIComponent(key))
+    .then(function(r){return r.json()})
+    .then(function(list){
+      var sel=document.getElementById('tts_model_sel');
+      var cur=sel.value;
+      sel.innerHTML='';
+      if(list.length===0){sel.innerHTML='<option value="">No models found</option>';btn.disabled=false;btn.textContent='Scan';note.textContent='No TTS models found.';return;}
+      list.forEach(function(m){
+        var o=document.createElement('option');o.value=m.id;
+        o.textContent=m.id;
+        if(m.id===cur)o.selected=true;
+        sel.appendChild(o);
+      });
+      btn.disabled=false;btn.textContent='Scan';
+      note.textContent='Found '+list.length+' model(s).';
+    }).catch(function(e){btn.disabled=false;btn.textContent='Scan';note.textContent='Error: '+e;});
+}
 /* show/hide custom URL row */
 function updateCustom(){
   var v=document.getElementById('llm_provider').value;
   document.getElementById('custom_url_row').style.display=(v==='custom')?'block':'none';
-  var kc=document.getElementById('key_custom').closest('tr');
-  if(kc)kc.style.display=(v==='custom')?'':'none';
+}
+function updateSttCustom(){
+  var v=document.getElementById('stt_provider').value;
+  document.getElementById('stt_custom_row').style.display=(v==='custom')?'block':'none';
 }
 document.getElementById('llm_provider').addEventListener('change',updateCustom);
-document.getElementById('key_custom').addEventListener('input',function(){
-  if(this.value.length>0){
-    var p=document.getElementById('llm_provider');
-    var opts=p.querySelectorAll('option');
-    for(var i=0;i<opts.length;i++) if(opts[i].value==='custom'){opts[i].style.display='';return;}
-  }
-});
+document.getElementById('stt_provider').addEventListener('change',updateSttCustom);
 updateCustom();
+updateSttCustom();
 function updateTtsVoices(){
   var m=document.getElementById('tts_mode').value;
   document.getElementById('groq_voice_row').style.display=(m==='groq')?'block':'none';
   document.getElementById('openai_voice_row').style.display=(m==='openai')?'block':'none';
   document.getElementById('elevenlabs_voice_row').style.display=(m==='elevenlabs')?'block':'none';
+  document.getElementById('tts_custom_row').style.display=(m==='custom')?'block':'none';
   if(m==='elevenlabs') update11lCustom();
 }
 function update11lCustom(){
@@ -467,7 +528,15 @@ static void handleRoot()
     /* STT provider */
     page.replace("{{SP_GROQ}}",   stt_provider == "groq"   ? "selected" : "");
     page.replace("{{SP_OPENAI}}", stt_provider == "openai" ? "selected" : "");
+    page.replace("{{SP_CUSTOM}}", stt_provider == "custom" ? "selected" : "");
     page.replace("{{STT_MODEL}}", htmlEscape(stt_model));
+    page.replace("{{STT_CUSTOM_URL}}", htmlEscape(stt_custom_url));
+    page.replace("{{STT_CUSTOM_KEY}}", htmlEscape(stt_custom_key));
+    /* TTS custom */
+    page.replace("{{SEL_CUSTOM_TTS}}", tts_mode == "custom" ? "selected" : "");
+    page.replace("{{TTS_CUSTOM_URL}}", htmlEscape(tts_custom_url));
+    page.replace("{{TTS_CUSTOM_KEY}}", htmlEscape(tts_custom_key));
+    page.replace("{{TTS_MODEL}}",      htmlEscape(tts_model));
     /* System prompt */
     page.replace("{{SYS_PROMPT}}", htmlEscape(system_prompt));
     /* TTS mode selection */
@@ -682,13 +751,15 @@ static void handleScanModels()
 
 static void handleScanSttModels()
 {
-    String prov = web.arg("stt_provider");
-    String key  = web.arg("api_key");
+    String prov           = web.arg("stt_provider");
+    String key            = web.arg("api_key");
+    String custom_url_arg = web.arg("custom_url");
     if (prov.length() == 0) prov = stt_provider;
 
     String url;
-    if (prov == "openai") url = "https://api.openai.com/v1";
-    else                  url = "https://api.groq.com/openai/v1";
+    if (prov == "openai")      url = "https://api.openai.com/v1";
+    else if (prov == "custom") url = custom_url_arg.length() > 0 ? custom_url_arg : stt_custom_url;
+    else                       url = "https://api.groq.com/openai/v1";
 
     Serial.printf("[PORTAL] STT model scan: provider=%s\n", prov.c_str());
 
@@ -738,6 +809,63 @@ static void handleScanSttModels()
     web.send(200, "application/json", json);
 }
 
+static void handleScanTtsModels()
+{
+    String url = web.arg("custom_url");
+    String key = web.arg("api_key");
+    if (url.length() == 0) url = tts_custom_url;
+
+    Serial.printf("[PORTAL] TTS model scan: %s\n", url.c_str());
+
+    String json = "[";
+    int count = 0;
+
+    if (url.length() > 0) {
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        String endpoint = url;
+        if (!endpoint.endsWith("/")) endpoint += "/";
+        endpoint += "models";
+
+        if (http.begin(client, endpoint)) {
+            if (key.length() > 0)
+                http.addHeader("Authorization", "Bearer " + key);
+            http.setTimeout(10000);
+
+            int code = http.GET();
+            Serial.printf("[PORTAL] TTS models HTTP %d\n", code);
+
+            if (code == 200) {
+                String body = http.getString();
+                JsonDocument doc;
+                DeserializationError err = deserializeJson(doc, body);
+                body = "";
+                if (!err && doc["data"].is<JsonArray>()) {
+                    for (JsonObject m : doc["data"].as<JsonArray>()) {
+                        const char *id = m["id"] | "";
+                        if (!id[0]) continue;
+                        /* Keep TTS / speech / audio-generation models */
+                        if (strstr(id, "tts")     || strstr(id, "speech") ||
+                            strstr(id, "orpheus") || strstr(id, "audio-gen")) {
+                            if (count > 0) json += ",";
+                            json += "{\"id\":\"";
+                            json += id;
+                            json += "\"}";
+                            count++;
+                        }
+                    }
+                }
+            }
+            http.end();
+        }
+    }
+
+    json += "]";
+    Serial.printf("[PORTAL] Returning %d TTS models\n", count);
+    web.send(200, "application/json", json);
+}
+
 static void handleSaveWifi()
 {
     wifi_ssid = web.arg("ssid");
@@ -765,12 +893,17 @@ void config_portal_set_settings_changed_cb(void (*cb)(void))
 
 static void handleSaveApi()
 {
-    llm_provider = web.arg("llm_provider");
-    model_name   = web.arg("model");
-    stt_provider = web.arg("stt_provider");
-    stt_model    = web.arg("stt_model");
-    tts_mode     = web.arg("tts_mode");
-    tts_voice    = web.arg("tts_voice");
+    llm_provider  = web.arg("llm_provider");
+    model_name    = web.arg("model");
+    stt_provider  = web.arg("stt_provider");
+    stt_model     = web.arg("stt_model");
+    stt_custom_url = web.arg("stt_custom_url");
+    stt_custom_key = web.arg("stt_custom_key");
+    tts_mode      = web.arg("tts_mode");
+    tts_voice     = web.arg("tts_voice");
+    tts_custom_url = web.arg("tts_custom_url");
+    tts_custom_key = web.arg("tts_custom_key");
+    tts_model     = web.arg("tts_model");
     if (llm_provider.length() == 0) llm_provider = "groq";
     if (model_name.length() == 0)   model_name   = "llama-3.3-70b-versatile";
     if (stt_provider.length() == 0) stt_provider = "groq";
@@ -790,13 +923,18 @@ static void handleSaveApi()
 
     prefs.begin("m8b", false);
     prefs.putString("llm_prov",  llm_provider);
-    prefs.putString("stt_prov",  stt_provider);
-    prefs.putString("stt_model", stt_model);
-    prefs.putString("api_url",   api_url);
-    prefs.putString("api_key",   api_key);
-    prefs.putString("model",     model_name);
-    prefs.putString("tts_mode",  tts_mode);
-    prefs.putString("tts_voice", tts_voice);
+    prefs.putString("stt_prov",       stt_provider);
+    prefs.putString("stt_model",      stt_model);
+    prefs.putString("stt_custom_url", stt_custom_url);
+    prefs.putString("stt_custom_key", stt_custom_key);
+    prefs.putString("api_url",        api_url);
+    prefs.putString("api_key",        api_key);
+    prefs.putString("model",          model_name);
+    prefs.putString("tts_mode",       tts_mode);
+    prefs.putString("tts_voice",      tts_voice);
+    prefs.putString("tts_custom_url", tts_custom_url);
+    prefs.putString("tts_custom_key", tts_custom_key);
+    prefs.putString("tts_model",      tts_model);
     prefs.end();
 
     if (settings_changed_cb) settings_changed_cb();
@@ -889,6 +1027,11 @@ void config_portal_begin(void)
     llm_provider  = prefs.getString("llm_prov",  "groq");
     stt_provider  = prefs.getString("stt_prov",  "groq");
     stt_model     = prefs.getString("stt_model", "");
+    stt_custom_url = prefs.getString("stt_custom_url", "");
+    stt_custom_key = prefs.getString("stt_custom_key", "");
+    tts_custom_url = prefs.getString("tts_custom_url", "");
+    tts_custom_key = prefs.getString("tts_custom_key", "");
+    tts_model     = prefs.getString("tts_model",  "");
     /* derived URL/key (or legacy fallback) */
     api_url       = url_for_provider(llm_provider);
     api_key       = key_for_provider(llm_provider);
@@ -945,6 +1088,7 @@ void config_portal_begin(void)
     web.on("/scan_wifi",       HTTP_GET,  handleScanWifi);
     web.on("/scan_models",     HTTP_GET,  handleScanModels);
     web.on("/scan_stt_models", HTTP_GET,  handleScanSttModels);
+    web.on("/scan_tts_models", HTTP_GET,  handleScanTtsModels);
     web.on("/save_wifi",       HTTP_POST, handleSaveWifi);
     web.on("/save_keys",       HTTP_POST, handleSaveKeys);
     web.on("/save_api",        HTTP_POST, handleSaveApi);
@@ -970,14 +1114,23 @@ String config_portal_get_tts_mode(void)      { return tts_mode; }
 String config_portal_get_tts_voice(void)     { return tts_voice; }
 String config_portal_get_stt_provider(void)  { return stt_provider; }
 String config_portal_get_stt_model(void)     { return stt_model;    }
-String config_portal_get_stt_url(void)       { return url_for_provider(stt_provider); }
-String config_portal_get_stt_key(void)       { return key_for_provider(stt_provider); }
+String config_portal_get_stt_url(void) {
+    if (stt_provider == "custom") return stt_custom_url;
+    return url_for_provider(stt_provider);
+}
+String config_portal_get_stt_key(void) {
+    if (stt_provider == "custom") return stt_custom_key;
+    return key_for_provider(stt_provider);
+}
 String config_portal_get_tts_key(void) {
-    if (tts_mode == "openai") return key_openai;
+    if (tts_mode == "custom")     return tts_custom_key;
+    if (tts_mode == "openai")     return key_openai;
     if (tts_mode == "elevenlabs") return key_elevenlabs;
     return key_groq;  /* groq or sam (sam doesn't use it) */
 }
 String config_portal_get_tts_url(void) {
+    if (tts_mode == "custom") return tts_custom_url;
     if (tts_mode == "openai") return url_for_provider("openai");
     return url_for_provider("groq");
 }
+String config_portal_get_tts_model(void) { return tts_model; }

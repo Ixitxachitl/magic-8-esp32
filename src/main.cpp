@@ -258,6 +258,18 @@ static void apply_provider_settings()
                 tts_init();
                 Serial.println("[SETTINGS] TTS: ElevenLabs key missing, fallback SAM");
             }
+        } else if (tts_mode_str == "custom") {
+            String tts_key = config_portal_get_tts_key();
+            String tts_url = config_portal_get_tts_url();
+            if (tts_key.length() > 0 && tts_url.length() > 0) {
+                tts_groq_init(tts_url, tts_key);
+                tts_groq_set_model(config_portal_get_tts_model());
+                Serial.printf("[SETTINGS] TTS: Custom (%s)\n", config_portal_get_tts_model().c_str());
+            } else {
+                tts_mode_str = "sam";
+                tts_init();
+                Serial.println("[SETTINGS] TTS: custom missing config, fallback SAM");
+            }
         } else if (tts_mode_str == "sam") {
             tts_init();
             Serial.println("[SETTINGS] TTS: SAM");
