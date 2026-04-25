@@ -84,7 +84,6 @@ static void llm_task(void *param)
         JsonDocument doc;
         doc["model"]      = cfg_model;
         doc["max_completion_tokens"] = 1024;
-        doc["temperature"] = 1.2;
 
         JsonArray msgs = doc["messages"].to<JsonArray>();
         JsonObject sm  = msgs.add<JsonObject>();
@@ -197,7 +196,7 @@ void llm_start_request(void)
     pending_question = "";
     req_pending = true;
     res_ready   = false;
-    xTaskCreatePinnedToCore(llm_task, "llm", 16384, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(llm_task, "llm", 32768, NULL, 1, NULL, 0);
 }
 
 void llm_start_request_with_question(const String &question)
@@ -210,7 +209,7 @@ void llm_start_request_with_question(const String &question)
     pending_question = question;
     req_pending = true;
     res_ready   = false;
-    xTaskCreatePinnedToCore(llm_task, "llm", 16384, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(llm_task, "llm", 32768, NULL, 1, NULL, 0);
 }
 
 bool llm_is_busy(void) { return req_pending; }
