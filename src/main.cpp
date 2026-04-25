@@ -830,10 +830,10 @@ void loop()
         }
         /* Keep timer alive while TTS is playing or a response is in progress */
         if (tts_playing)
-            last_activity_ms = now;
+            last_activity_ms = millis();
 
         if (qmi_ok && !tts_playing && !showing_battery &&
-            now - last_activity_ms > 10000UL) {
+            millis() - last_activity_ms > 10000UL) {
             touch_blocked   = true;   /* block LVGL touch events before any SPI changes */
             disp_brightness = 200;
             sleep_step_ms   = millis();
