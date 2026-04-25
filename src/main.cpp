@@ -113,6 +113,8 @@ static IMUdata imu_acc = {0.0f, 0.0f, 0.0f};
 /* I2C bus mutex – protects Wire access across cores */
 static SemaphoreHandle_t i2c_mux = NULL;
 
+static unsigned long  last_activity_ms = 0;  /* reset on any touch/motion */
+
 static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     /* While sleeping/fading, block LVGL touch events to prevent SPI
@@ -133,6 +135,7 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->point.x = (LCD_WIDTH  - 1) - x[0];
         data->point.y = (LCD_HEIGHT - 1) - y[0];
         data->state   = LV_INDEV_STATE_PR;
+        last_activity_ms = millis();  /* any touch resets inactivity timer */
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
@@ -192,7 +195,7 @@ static String         pending_answer;
 static bool           settle_complete      = false;
 
 /* ── display sleep / wake ──────────────────────────────────────────────── */
-static unsigned long  last_activity_ms   = 0;
+/* last_activity_ms defined above, before my_touchpad_read */
 static uint8_t        disp_brightness    = 200;
 static unsigned long  sleep_step_ms      = 0;
 static unsigned long  sleep_imu_poll_ms  = 0;
@@ -739,6 +742,9 @@ void loop()
             }
             if (touched) {
                 Serial.println("[SLEEP] Touch detected – waking");
+                lvgl_lock();
+                magic8ball_ui_set_answer("HOLD TO\nASK");
+                lvgl_unlock();
                 sleep_waking  = true;
                 sleep_step_ms = now;
             }
@@ -758,9 +764,6 @@ void loop()
                     touch_blocked    = false;
                     sleep_waking     = false;
                     last_activity_ms = millis();
-                    lvgl_lock();
-                    magic8ball_ui_set_answer("HOLD TO\nASK");
-                    lvgl_unlock();
                     app_state        = STATE_IDLE;
                     Serial.println("[SLEEP] Awake");
                 }
@@ -781,6 +784,9 @@ void loop()
                 sleep_prev_mag = mag;
                 if (delta > 0.3f) {
                     Serial.println("[SLEEP] Motion detected – waking");
+                    lvgl_lock();
+                    magic8ball_ui_set_answer("HOLD TO\nASK");
+                    lvgl_unlock();
                     sleep_waking  = true;
                     sleep_step_ms = now;
                 }
@@ -791,6 +797,7 @@ void loop()
 
     case STATE_IDLE:
     default: {
+        unsigned long now = millis();
         /* legacy LLM result check (no-mic path) */
         String answer;
         if (llm_check_result(answer)) {
@@ -803,8 +810,30 @@ void loop()
             last_activity_ms = millis();
         }
         /* Inactivity → fade display to sleep */
+        /* Also poll IMU so motion while awake resets the timer */
+        if (qmi_ok && now - sleep_imu_poll_ms >= 200) {
+            sleep_imu_poll_ms = now;
+            bool got = false;
+            if (xSemaphoreTake(i2c_mux, pdMS_TO_TICKS(5))) {
+                got = qmi.getAccelerometer(imu_acc.x, imu_acc.y, imu_acc.z);
+                xSemaphoreGive(i2c_mux);
+            }
+            if (got) {
+                float mag = sqrtf(imu_acc.x * imu_acc.x +
+                                  imu_acc.y * imu_acc.y +
+                                  imu_acc.z * imu_acc.z);
+                float delta = fabsf(mag - sleep_prev_mag);
+                sleep_prev_mag = mag;
+                if (delta > 0.3f)
+                    last_activity_ms = now;
+            }
+        }
+        /* Keep timer alive while TTS is playing or a response is in progress */
+        if (tts_playing)
+            last_activity_ms = now;
+
         if (qmi_ok && !tts_playing && !showing_battery &&
-            millis() - last_activity_ms > 10000UL) {
+            now - last_activity_ms > 10000UL) {
             touch_blocked   = true;   /* block LVGL touch events before any SPI changes */
             disp_brightness = 200;
             sleep_step_ms   = millis();
@@ -815,6 +844,15 @@ void loop()
     }
 
     } /* end switch */
+
+    /* While the app is busy (not truly idle), keep the activity timestamp
+       current so the 10-second sleep countdown only begins from the moment
+       the device returns to STATE_IDLE. */
+    if (app_state != STATE_IDLE &&
+        app_state != STATE_FADING_OUT &&
+        app_state != STATE_SLEEPING) {
+        last_activity_ms = millis();
+    }
 
     /* PMIC button: single press = show battery, double press = AP setup */
     if (pmic_ok) {
