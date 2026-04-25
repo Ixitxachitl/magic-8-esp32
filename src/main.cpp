@@ -102,7 +102,8 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area,
 
 /* ── Touch ─────────────────────────────────────────────────────── */
 TouchDrvCST92xx touch;
-static bool touch_ok = false;
+static bool touch_ok      = false;
+static bool touch_blocked = false;  /* true while fading/sleeping – suppresses LVGL events */
 
 /* ── IMU (QMI8658 @ 0x6B) ──────────────────────────────────────── */
 SensorQMI8658 qmi;
@@ -114,6 +115,12 @@ static SemaphoreHandle_t i2c_mux = NULL;
 
 static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    /* While sleeping/fading, block LVGL touch events to prevent SPI
+       collisions between LVGL flush and gfx->setBrightness().         */
+    if (touch_blocked) {
+        data->state = LV_INDEV_STATE_REL;
+        return;
+    }
     int16_t x[1], y[1];
     bool pressed = false;
     if (touch_ok && i2c_mux) {
@@ -701,9 +708,13 @@ void loop()
             sleep_step_ms = now;
             if (disp_brightness >= 10) {
                 disp_brightness -= 10;
+                lvgl_lock();
                 gfx->setBrightness(disp_brightness);
+                lvgl_unlock();
             } else {
+                lvgl_lock();
                 gfx->setBrightness(0);
+                lvgl_unlock();
                 disp_brightness   = 0;
                 sleep_waking      = false;
                 sleep_prev_mag    = 1.0f;
@@ -717,6 +728,22 @@ void loop()
 
     case STATE_SLEEPING: {
         unsigned long now = millis();
+
+        /* Check for touch-to-wake while display is off */
+        if (!sleep_waking && touch_ok) {
+            int16_t tx[1], ty[1];
+            bool touched = false;
+            if (xSemaphoreTake(i2c_mux, pdMS_TO_TICKS(5))) {
+                touched = touch.getPoint(tx, ty, 1);
+                xSemaphoreGive(i2c_mux);
+            }
+            if (touched) {
+                Serial.println("[SLEEP] Touch detected – waking");
+                sleep_waking  = true;
+                sleep_step_ms = now;
+            }
+        }
+
         if (sleep_waking) {
             /* Fade brightness back up */
             if (now - sleep_step_ms >= 20) {
@@ -724,8 +751,11 @@ void loop()
                 if (disp_brightness < 200) {
                     disp_brightness += 10;
                     if (disp_brightness > 200) disp_brightness = 200;
+                    lvgl_lock();
                     gfx->setBrightness(disp_brightness);
+                    lvgl_unlock();
                 } else {
+                    touch_blocked    = false;
                     sleep_waking     = false;
                     last_activity_ms = millis();
                     lvgl_lock();
@@ -772,13 +802,13 @@ void loop()
             tone_player_chime();
             last_activity_ms = millis();
         }
-        /* Inactivity → fade display to sleep (requires IMU for wake) */
+        /* Inactivity → fade display to sleep */
         if (qmi_ok && !tts_playing && !showing_battery &&
             millis() - last_activity_ms > 10000UL) {
+            touch_blocked   = true;   /* block LVGL touch events before any SPI changes */
             disp_brightness = 200;
-            gfx->setBrightness(200);
-            sleep_step_ms = millis();
-            app_state     = STATE_FADING_OUT;
+            sleep_step_ms   = millis();
+            app_state       = STATE_FADING_OUT;
             Serial.println("[SLEEP] Inactivity timeout – fading out");
         }
         break;
@@ -800,8 +830,15 @@ void loop()
             gfx->setBrightness(200);
             /* Wake from sleep / cancel fade if needed */
             if (app_state == STATE_SLEEPING || app_state == STATE_FADING_OUT) {
-                sleep_waking = false;
-                app_state    = STATE_IDLE;
+                touch_blocked = false;
+                sleep_waking  = false;
+                lvgl_lock();
+                gfx->setBrightness(200);
+                magic8ball_ui_set_answer("HOLD TO\nASK");
+                lvgl_unlock();
+                disp_brightness  = 200;
+                last_activity_ms = now;
+                app_state        = STATE_IDLE;
                 Serial.println("[SLEEP] Woken by power button");
             }
             if (now - last_pkey_ms < DOUBLE_PRESS_WINDOW_MS) {
