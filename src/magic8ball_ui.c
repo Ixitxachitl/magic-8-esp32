@@ -84,6 +84,9 @@ static int         dot_phase   = 0;
 static void (*tap_cb)(void)       = NULL;
 static void (*longpress_cb)(void) = NULL;
 
+/* track whether THIS press started the animation (for cancel logic) */
+static bool press_started_anim = false;
+
 /* ── animation state ───────────────────────────────────────────── */
 static bool        animating    = false;
 static lv_timer_t *anim_timer   = NULL;
@@ -505,14 +508,31 @@ static void ico_face_draw_cb(lv_event_t *e)
     }
 }
 
-/* ── event handler (tap / long-press on the circle) ────────────── */
+/* ── event handler for the circle ──────────────────────────────── */
 static void circle_evt_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_SHORT_CLICKED && tap_cb && !is_thinking)
+
+    /* Touch down: start spin immediately (only if idle/settled) */
+    if (code == LV_EVENT_PRESSED && !is_thinking && !animating && !pending_spin) {
+        press_started_anim = true;
+        magic8ball_ui_start_anim();
+        return;
+    }
+
+    /* Released before 1 s – cancel, restore prompt */
+    if ((code == LV_EVENT_SHORT_CLICKED || code == LV_EVENT_PRESS_LOST)
+        && press_started_anim) {
+        press_started_anim = false;
+        magic8ball_ui_set_answer("HOLD TO\nASK");
+        return;
+    }
+
+    /* Held 1 s – commit and trigger ask */
+    if (code == LV_EVENT_LONG_PRESSED && tap_cb && !is_thinking) {
+        press_started_anim = false;
         tap_cb();
-    if (code == LV_EVENT_LONG_PRESSED && longpress_cb)
-        longpress_cb();
+    }
 }
 
 /* ── public API ────────────────────────────────────────────────── */
@@ -543,8 +563,11 @@ void magic8ball_ui_init(lv_obj_t *parent, int screen_size)
     lv_obj_clear_flag(bg_circle, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(bg_circle, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_clip_corner(bg_circle, true, 0);
-    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_add_event_cb(bg_circle, ico_face_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_PRESSED,       NULL);
+    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_SHORT_CLICKED,  NULL);
+    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_PRESS_LOST,     NULL);
+    lv_obj_add_event_cb(bg_circle, circle_evt_cb, LV_EVENT_LONG_PRESSED,   NULL);
+    lv_obj_add_event_cb(bg_circle, ico_face_draw_cb, LV_EVENT_DRAW_MAIN,   NULL);
 
     /* -- create bubble objects (behind icosahedron) -- */
     for (int i = 0; i < NUM_BUBBLES; i++) {
@@ -596,7 +619,7 @@ void magic8ball_ui_init(lv_obj_t *parent, int screen_size)
     /* -- answer text (centred inside icosahedron) -- */
     int text_w = (int)(ico_radius * 1.2f);
     answer_lbl = lv_label_create(bg_circle);
-    lv_label_set_text(answer_lbl, "TAP TO\nASK");
+    lv_label_set_text(answer_lbl, "HOLD TO\nASK");
     lv_obj_set_style_text_color(answer_lbl, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(answer_lbl, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_align(answer_lbl, LV_TEXT_ALIGN_CENTER, 0);

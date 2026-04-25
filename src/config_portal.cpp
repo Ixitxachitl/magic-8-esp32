@@ -104,6 +104,7 @@ body{font-family:Arial,sans-serif;background:#0a0a1a;color:#ddd;margin:0;padding
 h1{text-align:center;color:#4488cc;margin-bottom:4px}
 p.sub{text-align:center;color:#667;margin-top:0}
 h2{color:#77a;font-size:16px;margin:18px 0 6px;border-bottom:1px solid #222;padding-bottom:6px}
+h3{color:#99b;font-size:14px;margin:14px 0 4px;padding-left:4px;border-left:3px solid #336}
 label{display:block;margin-top:12px;font-size:14px;color:#99a}
 input,select,textarea{width:100%;padding:10px;margin-top:4px;background:#12122a;
       color:#eee;border:1px solid #335;border-radius:6px;font-size:15px}
@@ -166,7 +167,9 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 
 <!-- ═══════ Provider Selection ═══════ -->
 <h2>&#x1F527; Provider Settings</h2>
-<label>LLM Provider</label>
+
+<h3>&#x1F916; Language Model (LLM)</h3>
+<label>Provider</label>
 <select id="llm_provider">
   <option value="groq" {{LP_GROQ}}>Groq</option>
   <option value="gemini" {{LP_GEMINI}}>Gemini</option>
@@ -191,7 +194,8 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 </div>
 <p class="note" id="model_note">Click Scan to fetch available models from the selected LLM provider.</p>
 
-<label>STT Provider (Speech-to-Text)</label>
+<h3>&#x1F3A4; Speech-to-Text (STT)</h3>
+<label>Provider</label>
 <select id="stt_provider" onchange="updateSttCustom()">
   <option value="groq" {{SP_GROQ}}>Groq (Whisper)</option>
   <option value="openai" {{SP_OPENAI}}>OpenAI (Whisper)</option>
@@ -216,8 +220,8 @@ table.keys input{margin-top:0;font-size:14px;padding:8px}
 </div>
 <p class="note" id="stt_model_note">Click Scan to fetch available Whisper models from the selected STT provider.</p>
 
-<h2>&#x1F50A; Text-to-Speech</h2>
-<label>TTS Engine</label>
+<h3>&#x1F50A; Text-to-Speech (TTS)</h3>
+<label>Engine</label>
 <select id="tts_mode" onchange="updateTtsVoices()">
   <option value="sam" {{SEL_SAM}}>SAM (offline, robotic)</option>
   <option value="groq" {{SEL_GROQ}}>Groq Orpheus (online, natural)</option>

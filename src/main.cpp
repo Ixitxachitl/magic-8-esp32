@@ -27,6 +27,7 @@
 #include "tts_sam.h"
 #include "tts_groq.h"
 #include "tts_elevenlabs.h"
+#include "SensorQMI8658.hpp"
 #include <esp_task_wdt.h>
 
 /* ── Classic Magic 8 Ball fallback answers (no-WiFi mode) ──────── */
@@ -103,6 +104,11 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area,
 TouchDrvCST92xx touch;
 static bool touch_ok = false;
 
+/* ── IMU (QMI8658 @ 0x6B) ──────────────────────────────────────── */
+SensorQMI8658 qmi;
+static bool    qmi_ok  = false;
+static IMUdata imu_acc = {0.0f, 0.0f, 0.0f};
+
 /* I2C bus mutex – protects Wire access across cores */
 static SemaphoreHandle_t i2c_mux = NULL;
 
@@ -167,7 +173,9 @@ enum AppState {
     STATE_SETTLING_TRANSCRIPT,    /* decelerating spin before text    */
     STATE_SHOWING_TRANSCRIPT,     /* transcript visible, then re-spin */
     STATE_ASKING_LLM,             /* waiting for 8-ball answer        */
-    STATE_SETTLING_ANSWER         /* decelerating spin before answer  */
+    STATE_SETTLING_ANSWER,        /* decelerating spin before answer  */
+    STATE_FADING_OUT,             /* stepping display brightness to 0 */
+    STATE_SLEEPING                /* display off, polling IMU for wake*/
 };
 static AppState       app_state          = STATE_IDLE;
 static unsigned long  last_partial_ms    = 0;
@@ -175,6 +183,14 @@ static unsigned long  transcript_shown_ms = 0;
 static String         final_transcript;
 static String         pending_answer;
 static bool           settle_complete      = false;
+
+/* ── display sleep / wake ──────────────────────────────────────────────── */
+static unsigned long  last_activity_ms   = 0;
+static uint8_t        disp_brightness    = 200;
+static unsigned long  sleep_step_ms      = 0;
+static unsigned long  sleep_imu_poll_ms  = 0;
+static float          sleep_prev_mag     = 1.0f;
+static bool           sleep_waking       = false;
 
 /* ── TTS background task ───────────────────────────────────────── */
 static volatile bool  tts_playing          = false;
@@ -293,7 +309,7 @@ static void on_ask(void)
         Serial.println("[MAIN] on_ask: busy, ignoring");
         return;
     }
-
+    last_activity_ms = millis();
     Serial.println("[MAIN] on_ask: Asking the 8 Ball...");
     lvgl_lock();
     magic8ball_ui_start_anim();
@@ -431,6 +447,17 @@ void setup()
     touch_ok = touch.begin(Wire, CST92XX_SLAVE_ADDRESS);
     Serial.printf("[INIT] Touch CST9217 %s\n", touch_ok ? "OK" : "FAIL");
 
+    /* ── IMU (QMI8658) ───────────────────────────────────────────────── */
+    if (qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
+        qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
+                                SensorQMI8658::ACC_ODR_LOWPOWER_128Hz);
+        qmi.enableAccelerometer();
+        qmi_ok = true;
+        Serial.println("[INIT] QMI8658 IMU OK");
+    } else {
+        Serial.println("[INIT] QMI8658 IMU FAIL (sleep-on-idle disabled)");
+    }
+
     /* ── LVGL ────────────────────────────────────────────────── */
     lv_init();
     Serial.println("[INIT] LVGL initialized");
@@ -460,10 +487,11 @@ void setup()
 
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
-    indev_drv.type    = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
+    indev_drv.type            = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb         = my_touchpad_read;
+    indev_drv.long_press_time = 1000;   /* 1-second hold triggers ask */
     lv_indev_drv_register(&indev_drv);
-    Serial.println("[INIT] LVGL touch input registered");
+    Serial.println("[INIT] LVGL touch input registered (2s long-press to ask)");
 
     /* ── Magic 8 Ball UI ───────────────────────────────────────── */
     Serial.println("[INIT] Creating Magic 8 Ball UI...");
@@ -507,11 +535,13 @@ void setup()
         /* ── Apply all provider settings ────────────────────── */
         apply_provider_settings();
 
-        magic8ball_ui_set_answer("TAP TO\nASK");
+        magic8ball_ui_set_answer("HOLD TO\nASK");
     } else {
         Serial.println("[INIT] Not configured – showing AP setup screen");
         magic8ball_ui_set_answer("Connect WiFi:\nMagic8Ball\n-Setup\n192.168.4.1");
     }
+
+    last_activity_ms = millis();
 
     Serial.println("[INIT] ---- Memory Report ----");
     Serial.printf("[INIT]   Free heap:     %u bytes\n", ESP.getFreeHeap());
@@ -554,8 +584,9 @@ void loop()
                 Serial.println("[LOOP] No usable audio – back to idle");
                 lvgl_lock();
                 magic8ball_ui_stop_anim();
-                magic8ball_ui_set_answer("TAP TO\nASK");
+                magic8ball_ui_set_answer("HOLD TO\nASK");
                 lvgl_unlock();
+                last_activity_ms = millis();
                 app_state = STATE_IDLE;
             }
         }
@@ -656,8 +687,74 @@ void loop()
                 }
             }
             pending_answer = "";
+            last_activity_ms = millis();
             app_state = STATE_IDLE;
             Serial.println("[LOOP] → IDLE (answer shown)");
+        }
+        break;
+    }
+
+    case STATE_FADING_OUT: {
+        /* Step brightness to 0 then enter sleep (non-blocking) */
+        unsigned long now = millis();
+        if (now - sleep_step_ms >= 30) {
+            sleep_step_ms = now;
+            if (disp_brightness >= 10) {
+                disp_brightness -= 10;
+                gfx->setBrightness(disp_brightness);
+            } else {
+                gfx->setBrightness(0);
+                disp_brightness   = 0;
+                sleep_waking      = false;
+                sleep_prev_mag    = 1.0f;
+                sleep_imu_poll_ms = 0;
+                app_state         = STATE_SLEEPING;
+                Serial.println("[SLEEP] Display off – sleeping");
+            }
+        }
+        break;
+    }
+
+    case STATE_SLEEPING: {
+        unsigned long now = millis();
+        if (sleep_waking) {
+            /* Fade brightness back up */
+            if (now - sleep_step_ms >= 20) {
+                sleep_step_ms = now;
+                if (disp_brightness < 200) {
+                    disp_brightness += 10;
+                    if (disp_brightness > 200) disp_brightness = 200;
+                    gfx->setBrightness(disp_brightness);
+                } else {
+                    sleep_waking     = false;
+                    last_activity_ms = millis();
+                    lvgl_lock();
+                    magic8ball_ui_set_answer("HOLD TO\nASK");
+                    lvgl_unlock();
+                    app_state        = STATE_IDLE;
+                    Serial.println("[SLEEP] Awake");
+                }
+            }
+        } else if (qmi_ok && now - sleep_imu_poll_ms >= 100) {
+            /* Poll IMU for shake/tap motion every 100 ms */
+            sleep_imu_poll_ms = now;
+            bool got = false;
+            if (xSemaphoreTake(i2c_mux, pdMS_TO_TICKS(10))) {
+                got = qmi.getAccelerometer(imu_acc.x, imu_acc.y, imu_acc.z);
+                xSemaphoreGive(i2c_mux);
+            }
+            if (got) {
+                float mag = sqrtf(imu_acc.x * imu_acc.x +
+                                  imu_acc.y * imu_acc.y +
+                                  imu_acc.z * imu_acc.z);
+                float delta = fabsf(mag - sleep_prev_mag);
+                sleep_prev_mag = mag;
+                if (delta > 0.3f) {
+                    Serial.println("[SLEEP] Motion detected – waking");
+                    sleep_waking  = true;
+                    sleep_step_ms = now;
+                }
+            }
         }
         break;
     }
@@ -673,6 +770,16 @@ void loop()
             magic8ball_ui_set_answer(answer.c_str());
             lvgl_unlock();
             tone_player_chime();
+            last_activity_ms = millis();
+        }
+        /* Inactivity → fade display to sleep (requires IMU for wake) */
+        if (qmi_ok && !tts_playing && !showing_battery &&
+            millis() - last_activity_ms > 10000UL) {
+            disp_brightness = 200;
+            gfx->setBrightness(200);
+            sleep_step_ms = millis();
+            app_state     = STATE_FADING_OUT;
+            Serial.println("[SLEEP] Inactivity timeout – fading out");
         }
         break;
     }
@@ -688,7 +795,15 @@ void loop()
         xSemaphoreGive(i2c_mux);
         if (short_press) {
             unsigned long now = millis();
+            last_activity_ms = now;
+            disp_brightness  = 200;
             gfx->setBrightness(200);
+            /* Wake from sleep / cancel fade if needed */
+            if (app_state == STATE_SLEEPING || app_state == STATE_FADING_OUT) {
+                sleep_waking = false;
+                app_state    = STATE_IDLE;
+                Serial.println("[SLEEP] Woken by power button");
+            }
             if (now - last_pkey_ms < DOUBLE_PRESS_WINDOW_MS) {
                 pkey_press_count++;
                 pkey_single_pending = false;   /* cancel single-press action */
@@ -730,8 +845,9 @@ void loop()
         if (showing_battery && millis() - batt_display_ms > 2000) {
             showing_battery = false;
             lvgl_lock();
-            magic8ball_ui_set_answer("TAP TO\nASK");
+            magic8ball_ui_set_answer("HOLD TO\nASK");
             lvgl_unlock();
+            last_activity_ms = millis();
         }
     }
 
