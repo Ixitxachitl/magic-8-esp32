@@ -71,7 +71,7 @@ static size_t build_body(uint8_t *dst, const int16_t *ds_samples, size_t ds_coun
     APPEND_STR("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n");
     APPEND_STR("Content-Type: audio/wav\r\n\r\n");
 
-    write_wav_header(dst + pos, pcm_bytes, 8000);
+    write_wav_header(dst + pos, pcm_bytes, 16000);
     pos += 44;
     memcpy(dst + pos, ds_samples, pcm_bytes);
     pos += pcm_bytes;
@@ -113,8 +113,8 @@ static size_t build_body(uint8_t *dst, const int16_t *ds_samples, size_t ds_coun
 static void trim_silence(const int16_t *samples, size_t count,
                          size_t *out_start, size_t *out_count)
 {
-    const size_t SR          = 8000;   /* samples are already at 8 kHz when trimming is applied */
-    const size_t WIN         = SR / 10; /* 100 ms window = 800 samples at 8 kHz */
+    const size_t SR          = 16000;  /* source samples are 16 kHz */
+    const size_t WIN         = SR / 10; /* 100 ms window */
     const int    THRESH      = 60;
     const size_t PAD         = SR / 20; /* 50 ms pad */
 
@@ -153,10 +153,18 @@ static void stt_task(void *param)
 
     bool is_deepgram = (cfg_url.indexOf("deepgram.com") >= 0);
 
-    /* ── 2:1 decimate 16 kHz → 8 kHz into PSRAM scratch buffer ── */
-    size_t ds_count   = p->sample_count / 2;
-    size_t pcm_bytes  = ds_count * sizeof(int16_t);
-    size_t body_alloc = pcm_bytes + 44 + 1024;
+    /* ── trim silence directly on native 16 kHz samples ───────── */
+    size_t trim_start = 0, trim_count = p->sample_count;
+    trim_silence(p->samples, p->sample_count, &trim_start, &trim_count);
+    Serial.printf("[STT] Trimmed: %u → %u samples (%.1f → %.1f s)\n",
+                  (unsigned)p->sample_count, (unsigned)trim_count,
+                  (float)p->sample_count / 16000.0f, (float)trim_count / 16000.0f);
+
+    const int16_t *trimmed       = p->samples + trim_start;
+    size_t         trimmed_bytes = trim_count * sizeof(int16_t);
+
+    /* ── allocate multipart body in PSRAM (separate from samples) ── */
+    size_t body_alloc = trimmed_bytes + 44 + 1024;
     uint8_t *body = (uint8_t *)heap_caps_malloc(body_alloc, MALLOC_CAP_SPIRAM);
     if (!body) {
         Serial.println("[STT] Body alloc failed");
@@ -164,28 +172,11 @@ static void stt_task(void *param)
         goto done;
     }
 
-    /* Decimate inline into the tail of the body buffer (after WAV header space) */
     {
-        int16_t *ds = (int16_t *)(body + 44);
-        for (size_t i = 0; i < ds_count; i++)
-            ds[i] = p->samples[i * 2];
-
-        /* Trim leading/trailing silence on the decimated 8 kHz samples */
-        size_t trim_start = 0, trim_count = ds_count;
-        trim_silence(ds, ds_count, &trim_start, &trim_count);
-        Serial.printf("[STT] Trimmed: %u → %u samples (%.1f → %.1f s)\n",
-                      (unsigned)ds_count, (unsigned)trim_count,
-                      (float)ds_count / 8000.0f, (float)trim_count / 8000.0f);
-
-        const int16_t *trimmed = ds + trim_start;
-        size_t trimmed_bytes   = trim_count * sizeof(int16_t);
-
     if (is_deepgram) {
         /* ── Deepgram: POST raw WAV to /v1/listen ──────────────────── */
-        write_wav_header(body, trimmed_bytes, 8000);
-        /* samples already sit at body+44; if trim_start > 0 move them down */
-        if (trim_start > 0)
-            memmove(body + 44, trimmed, trimmed_bytes);
+        write_wav_header(body, trimmed_bytes, 16000);
+        memcpy(body + 44, trimmed, trimmed_bytes);
         size_t body_len = 44 + trimmed_bytes;
         Serial.printf("[STT] Deepgram WAV body: %u bytes\n", (unsigned)body_len);
 
@@ -237,10 +228,8 @@ static void stt_task(void *param)
         heap_caps_free(body);
     } else {
         /* ── OpenAI-compatible: multipart/form-data ────────────────── */
-        /* Reuse the trimmed decimated samples already in body+44 */
-        if (trim_start > 0)
-            memmove(body + 44, trimmed, trimmed_bytes);
-        size_t body_len = build_body(body, (const int16_t *)(body + 44), trim_count);
+        /* trimmed points into p->samples (separate alloc) — no overlap */
+        size_t body_len = build_body(body, trimmed, trim_count);
         Serial.printf("[STT] Body built: %u bytes\n", (unsigned)body_len);
 
         WiFiClientSecure *client = new WiFiClientSecure();
